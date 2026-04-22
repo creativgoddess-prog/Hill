@@ -616,13 +616,15 @@ def main():
             "and add the token to your .env file."
         )
 
+    groq_key = os.getenv("GROQ_API_KEY")
     gemini_key = os.getenv("GEMINI_API_KEY")
     anthropic_key = os.getenv("ANTHROPIC_API_KEY")
-    if not gemini_key and not anthropic_key:
+    if not groq_key and not gemini_key and not anthropic_key:
         raise EnvironmentError(
             "No AI API key found!\n"
-            "FREE option: Get a Gemini key at aistudio.google.com → add GEMINI_API_KEY to .env\n"
-            "Paid option: Get a Claude key at console.anthropic.com → add ANTHROPIC_API_KEY to .env"
+            "FREE (recommended): Get a Groq key at console.groq.com → add GROQ_API_KEY to .env\n"
+            "Also free: Get a Gemini key at aistudio.google.com → add GEMINI_API_KEY to .env\n"
+            "Paid: Get a Claude key at console.anthropic.com → add ANTHROPIC_API_KEY to .env"
         )
 
     app = Application.builder().token(token).build()

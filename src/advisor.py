@@ -1,81 +1,94 @@
 """
-AI advisor — uses Google Gemini (FREE) by default, or Claude if you prefer.
+AI advisor — powered by Groq (FREE, fastest, least restrictive).
 
-Free tier options:
-  - Google Gemini: 1,500 free requests/day, no credit card needed
-                   Get key at: aistudio.google.com (click "Get API Key")
-  - Anthropic Claude: ~$5 free credit, then pay-as-you-go (~$1-5/month personal use)
-                      Get key at: console.anthropic.com
+Groq runs Llama 4 on custom silicon — blazing fast, 1,000 free
+requests/day, no credit card needed. Much less likely to refuse
+business tasks like sales copy, outreach scripts, or marketing content.
 
-Set GEMINI_API_KEY in your .env file to use Gemini (free).
-Set ANTHROPIC_API_KEY to use Claude instead.
-If both are set, Gemini is used by default.
+Get your free key at: console.groq.com (just a Google login, 60 seconds)
+Add it to your .env file: GROQ_API_KEY=your_key_here
+
+Fallback order if GROQ_API_KEY is not set:
+  GEMINI_API_KEY  → Google Gemini (also free, more restricted)
+  ANTHROPIC_API_KEY → Claude (paid, most restricted)
 """
 import os
-import json
 from rich.console import Console
 
 console = Console()
 
+GROQ_MODEL = "llama-3.3-70b-versatile"   # Fast, capable, low restrictions
 GEMINI_MODEL = "gemini-2.0-flash"
 CLAUDE_MODEL = "claude-opus-4-7"
 
 
 # ──────────────────────────────────────────────────────────────
-# Unified AI client — Gemini (free) or Claude
+# Unified AI client — Groq first, then Gemini, then Claude
 # ──────────────────────────────────────────────────────────────
 
 def _get_provider() -> str:
+    if os.getenv("GROQ_API_KEY"):
+        return "groq"
     if os.getenv("GEMINI_API_KEY"):
         return "gemini"
     if os.getenv("ANTHROPIC_API_KEY"):
         return "claude"
     raise EnvironmentError(
         "\n\nNo AI API key found!\n\n"
-        "EASIEST (FREE): Get a free Gemini key in 60 seconds:\n"
-        "  1. Go to aistudio.google.com\n"
-        "  2. Sign in with any Google account\n"
-        "  3. Click 'Get API Key'\n"
-        "  4. Add it to your .env file: GEMINI_API_KEY=your_key_here\n\n"
-        "ALTERNATIVE (paid): Get a Claude key at console.anthropic.com\n"
-        "  Add it to your .env file: ANTHROPIC_API_KEY=your_key_here"
+        "EASIEST (FREE, least restrictive): Get a Groq key in 60 seconds:\n"
+        "  1. Go to console.groq.com\n"
+        "  2. Sign in with Google\n"
+        "  3. Click 'API Keys' → 'Create API Key'\n"
+        "  4. Add to your .env file: GROQ_API_KEY=your_key_here\n\n"
+        "Alternatives (also free): GEMINI_API_KEY from aistudio.google.com\n"
+        "Paid option: ANTHROPIC_API_KEY from console.anthropic.com"
     )
 
 
 def ask_ai(system: str, messages: list[dict], max_tokens: int = 4000) -> str:
     """
-    Send a message to Gemini (free) or Claude and return the response text.
+    Send messages to the best available AI and return the response text.
     messages format: [{"role": "user"/"assistant", "content": "..."}]
     """
     provider = _get_provider()
-
+    if provider == "groq":
+        return _ask_groq(system, messages, max_tokens)
     if provider == "gemini":
         return _ask_gemini(system, messages, max_tokens)
-    else:
-        return _ask_claude(system, messages, max_tokens)
+    return _ask_claude(system, messages, max_tokens)
+
+
+def _ask_groq(system: str, messages: list[dict], max_tokens: int) -> str:
+    from groq import Groq
+
+    client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+    full_messages = [{"role": "system", "content": system}] + messages
+
+    response = client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=full_messages,
+        max_tokens=max_tokens,
+        temperature=0.7,
+    )
+    return response.choices[0].message.content
 
 
 def _ask_gemini(system: str, messages: list[dict], max_tokens: int) -> str:
     import google.generativeai as genai
 
     genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-
-    # Convert messages to Gemini format (role: "user"/"model", parts: [{text}])
     gemini_history = []
-    for msg in messages[:-1]:  # All but last message go into history
+    for msg in messages[:-1]:
         role = "model" if msg["role"] == "assistant" else "user"
         gemini_history.append({"role": role, "parts": [{"text": msg["content"]}]})
-
-    last_message = messages[-1]["content"] if messages else ""
 
     model = genai.GenerativeModel(
         model_name=GEMINI_MODEL,
         system_instruction=system,
         generation_config={"max_output_tokens": max_tokens, "temperature": 0.7},
     )
-
     chat = model.start_chat(history=gemini_history)
-    response = chat.send_message(last_message)
+    response = chat.send_message(messages[-1]["content"] if messages else "")
     return response.text
 
 
@@ -83,8 +96,6 @@ def _ask_claude(system: str, messages: list[dict], max_tokens: int) -> str:
     import anthropic
 
     client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-
-    # Claude uses "assistant" role (same as our format)
     response = client.messages.create(
         model=CLAUDE_MODEL,
         max_tokens=max_tokens,
