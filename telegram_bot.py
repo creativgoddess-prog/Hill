@@ -26,6 +26,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     ConversationHandler,
     ContextTypes,
+    PicklePersistence,
     filters,
 )
 from telegram.constants import ParseMode, ChatAction
@@ -107,8 +108,44 @@ async def typing(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── /start ───────────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data.clear()
+    # Check if user already has a saved plan in persistent storage
+    has_plan = bool(context.user_data.get("plan"))
+    has_profile = bool(context.user_data.get("interview_answers"))
+    chosen_method = context.user_data.get("chosen_method", "")
 
+    if has_plan and has_profile:
+        # User has a full session saved — offer to resume instantly
+        keyboard = [
+            [InlineKeyboardButton("▶️ Resume My Business Plan", callback_data="coach")],
+            [InlineKeyboardButton("🔄 Start Over (wipe everything)", callback_data="confirm_reset")],
+        ]
+        await update.message.reply_text(
+            "👋 *Welcome back!*\n\n"
+            f"I remember everything. Your plan for *{chosen_method}* is saved.\n\n"
+            "Tap *Resume* to jump straight back into coaching — "
+            "no need to redo the interview or research.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return MAIN_MENU
+
+    if has_profile and not has_plan:
+        # Has profile but no plan yet
+        keyboard = [
+            [InlineKeyboardButton("📋 Continue → Build My Plan", callback_data="interview")],
+            [InlineKeyboardButton("🏗️ Build My Business (Automated)", callback_data="build")],
+            [InlineKeyboardButton("🔄 Start Over", callback_data="confirm_reset")],
+        ]
+        await update.message.reply_text(
+            "👋 *Welcome back!*\n\n"
+            "I have your profile saved. You haven't built your plan yet.\n\n"
+            "Want to continue where you left off?",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return MAIN_MENU
+
+    # Fresh start — no saved data
     keyboard = [
         [InlineKeyboardButton("🔍 Research AI Income Methods", callback_data="research")],
         [InlineKeyboardButton("⚡ Skip Research → Start Interview", callback_data="interview")],
@@ -116,7 +153,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         [InlineKeyboardButton("💬 Daily Coaching Chat", callback_data="coach")],
         [InlineKeyboardButton("ℹ️ How This Works", callback_data="howto")],
     ]
-
     await update.message.reply_text(
         "👋 *Welcome to your AI Income Bot!*\n\n"
         "I can:\n"
@@ -127,6 +163,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         "💬 Coach you daily as your AI business partner\n\n"
         "*Target: $5,000/month · Under $300 startup · ~2 hrs/day*\n\n"
         "What do you want to do?",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+    return MAIN_MENU
+
+
+async def confirm_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    context.user_data.clear()
+    keyboard = [
+        [InlineKeyboardButton("🔍 Research AI Income Methods", callback_data="research")],
+        [InlineKeyboardButton("⚡ Skip Research → Start Interview", callback_data="interview")],
+        [InlineKeyboardButton("🏗️ Build My Business (Automated)", callback_data="build")],
+        [InlineKeyboardButton("💬 Daily Coaching Chat", callback_data="coach")],
+    ]
+    await query.edit_message_text(
+        "🔄 *All data cleared.* Starting fresh!\n\nWhat do you want to do?",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
@@ -837,7 +891,7 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
     await update.message.reply_text(
-        "🔄 Session reset! Type /start to begin again.",
+        "🔄 All your data has been wiped. Type /start to begin again from scratch.",
     )
     return ConversationHandler.END
 
@@ -871,7 +925,8 @@ def main():
             "Paid: Get a Claude key at console.anthropic.com → add ANTHROPIC_API_KEY to .env"
         )
 
-    app = Application.builder().token(token).build()
+    persistence = PicklePersistence(filepath="bot_sessions.pkl")
+    app = Application.builder().token(token).persistence(persistence).build()
 
     conv_handler = ConversationHandler(
         entry_points=[
@@ -886,6 +941,7 @@ def main():
                 CallbackQueryHandler(start_coaching, pattern="^coach$"),
                 CallbackQueryHandler(how_to, pattern="^howto$"),
                 CallbackQueryHandler(back_to_menu, pattern="^back_to_menu$"),
+                CallbackQueryHandler(confirm_reset, pattern="^confirm_reset$"),
             ],
             RESEARCHING: [
                 CallbackQueryHandler(start_interview, pattern="^interview$"),
