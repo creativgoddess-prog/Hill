@@ -990,9 +990,27 @@ def main():
             CommandHandler("reset", reset_command),
         ],
         allow_reentry=True,
+        name="main_conv",
+        persistent=True,
     )
 
     app.add_handler(conv_handler)
+
+    # Global fallbacks — fire when the user is outside any active conversation
+    # (e.g. after a restart, before /start, or after a stale button tap)
+    async def global_message_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text(
+            "👋 Send /start to pick up where you left off.\n\n"
+            "Your profile and plan are saved — you won't lose anything."
+        )
+
+    async def global_button_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.callback_query.answer(
+            "Session expired — send /start to continue.", show_alert=False
+        )
+
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, global_message_fallback))
+    app.add_handler(CallbackQueryHandler(global_button_fallback))
     app.add_error_handler(error_handler)
 
     print("=" * 50)
