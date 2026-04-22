@@ -47,7 +47,11 @@ logger = logging.getLogger(__name__)
     CHOOSING_METHOD,
     PLANNING,
     COACHING,
-) = range(8)
+    BUILD_NICHE,
+    BUILD_SERVICE,
+    BUILD_PLATFORMS,
+    BUILDING,
+) = range(12)
 
 # ── Interview questions ──────────────────────────────────────
 INTERVIEW_QUESTIONS = [
@@ -106,21 +110,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
 
     keyboard = [
-        [InlineKeyboardButton("🔍 Search the Internet for Methods", callback_data="research")],
-        [InlineKeyboardButton("⚡ Skip Research, Start Interview", callback_data="interview")],
-        [InlineKeyboardButton("💬 Jump to Coaching Chat", callback_data="coach")],
+        [InlineKeyboardButton("🔍 Research AI Income Methods", callback_data="research")],
+        [InlineKeyboardButton("⚡ Skip Research → Start Interview", callback_data="interview")],
+        [InlineKeyboardButton("🏗️ Build My Business (Automated)", callback_data="build")],
+        [InlineKeyboardButton("💬 Daily Coaching Chat", callback_data="coach")],
         [InlineKeyboardButton("ℹ️ How This Works", callback_data="howto")],
     ]
 
     await update.message.reply_text(
-        "👋 *Welcome to your AI Income Research Bot!*\n\n"
-        "I will:\n"
-        "🔍 Search the internet for the best AI money-making methods in 2026\n"
-        "🎯 Match them to YOUR specific skills and goals\n"
-        "📋 Build you a step-by-step 30-day business plan\n"
+        "👋 *Welcome to your AI Income Bot!*\n\n"
+        "I can:\n"
+        "🔍 Research what's actually working for AI income in 2026\n"
+        "🎯 Match you with the best method for YOUR skills\n"
+        "📋 Build your 30-day launch plan\n"
+        "🏗️ *Automate your entire business build* — brand, website, content, copy\n"
         "💬 Coach you daily as your AI business partner\n\n"
         "*Target: $5,000/month · Under $300 startup · ~2 hrs/day*\n\n"
-        "What do you want to do first?",
+        "What do you want to do?",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
@@ -160,9 +166,10 @@ async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     await query.answer()
 
     keyboard = [
-        [InlineKeyboardButton("🔍 Search the Internet for Methods", callback_data="research")],
-        [InlineKeyboardButton("⚡ Skip Research, Start Interview", callback_data="interview")],
-        [InlineKeyboardButton("💬 Jump to Coaching Chat", callback_data="coach")],
+        [InlineKeyboardButton("🔍 Research AI Income Methods", callback_data="research")],
+        [InlineKeyboardButton("⚡ Skip Research → Start Interview", callback_data="interview")],
+        [InlineKeyboardButton("🏗️ Build My Business (Automated)", callback_data="build")],
+        [InlineKeyboardButton("💬 Daily Coaching Chat", callback_data="coach")],
         [InlineKeyboardButton("ℹ️ How This Works", callback_data="howto")],
     ]
     await query.edit_message_text(
@@ -574,11 +581,248 @@ async def handle_coaching_message(update: Update, context: ContextTypes.DEFAULT_
     return COACHING
 
 
+# ── BUILD MY BUSINESS FLOW ───────────────────────────────────
+
+async def start_build(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        "🏗️ *Build My Business — Automated*\n\n"
+        "I will research your audience, then automatically generate:\n\n"
+        "✅ Complete brand identity (name, colors, voice, tagline)\n"
+        "✅ Full coded website — ready to go live in minutes\n"
+        "✅ 30-day social media content calendar\n"
+        "✅ Sales copy (headlines, emails, ad copy)\n\n"
+        "All delivered to you as files right here in Telegram.\n\n"
+        "First — *what is your niche or topic?*\n\n"
+        "Be specific. Instead of 'coaching' say 'life coaching for single moms' "
+        "or 'fitness coaching for men over 40' or 'AI content writing for realtors'.\n\n"
+        "The more specific, the better everything will be.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return BUILD_NICHE
+
+
+async def build_get_niche(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    niche = update.message.text.strip()
+    context.user_data["build_niche"] = niche
+    await update.message.reply_text(
+        f"Got it — *{niche}*\n\n"
+        "What specific service or product will you sell?\n\n"
+        "Examples:\n"
+        "• 1-on-1 coaching calls ($500/month)\n"
+        "• Done-for-you social media content packages\n"
+        "• Online course teaching my method\n"
+        "• AI-written blog content for businesses\n\n"
+        "What's yours?",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return BUILD_SERVICE
+
+
+async def build_get_service(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    service = update.message.text.strip()
+    context.user_data["build_service"] = service
+    keyboard = [
+        [InlineKeyboardButton("Instagram + TikTok", callback_data="platforms_ig_tt")],
+        [InlineKeyboardButton("Instagram + LinkedIn", callback_data="platforms_ig_li")],
+        [InlineKeyboardButton("TikTok only", callback_data="platforms_tt")],
+        [InlineKeyboardButton("LinkedIn only", callback_data="platforms_li")],
+        [InlineKeyboardButton("All platforms", callback_data="platforms_all")],
+    ]
+    await update.message.reply_text(
+        "Which social media platforms do you want content for?\n\n"
+        "(All content will be faceless — no camera required)",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+    return BUILD_PLATFORMS
+
+
+async def build_get_platforms(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    platform_map = {
+        "platforms_ig_tt": ["Instagram", "TikTok"],
+        "platforms_ig_li": ["Instagram", "LinkedIn"],
+        "platforms_tt": ["TikTok"],
+        "platforms_li": ["LinkedIn"],
+        "platforms_all": ["Instagram", "TikTok", "LinkedIn", "Facebook"],
+    }
+    platforms = platform_map.get(query.data, ["Instagram", "TikTok"])
+    context.user_data["build_platforms"] = platforms
+
+    niche = context.user_data.get("build_niche", "")
+    service = context.user_data.get("build_service", "")
+
+    await query.edit_message_text(
+        f"🚀 *Building your complete business now...*\n\n"
+        f"Niche: {niche}\n"
+        f"Service: {service}\n"
+        f"Platforms: {', '.join(platforms)}\n\n"
+        "This runs 5 steps automatically. I'll update you as each one completes.\n"
+        "Estimated time: 5-10 minutes.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+    asyncio.create_task(run_build_task(query, context))
+    return BUILDING
+
+
+async def run_build_task(query, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = query.message.chat_id
+    niche = context.user_data.get("build_niche", "")
+    service = context.user_data.get("build_service", "")
+    platforms = context.user_data.get("build_platforms", ["Instagram", "TikTok"])
+
+    step_messages = {
+        1: "🔍 Step 1/5 — Researching your audience's pain points across the web...",
+        2: "🎨 Step 2/5 — Building your brand identity...",
+        3: "✍️ Step 3/5 — Writing your sales copy (headlines, emails, ads)...",
+        4: "📅 Step 4/5 — Generating your 30-day social content calendar...",
+        5: "💻 Step 5/5 — Coding your complete website...",
+    }
+
+    progress_msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text="⏳ Starting build...",
+    )
+
+    import threading
+    from src.builder import build_full_business, save_assets
+    from pathlib import Path
+    import tempfile
+
+    result_holder = {}
+    current_step = {"n": 0}
+
+    def progress_cb(step, msg):
+        current_step["n"] = step
+
+    def do_build():
+        result_holder["assets"] = build_full_business(
+            niche, service, platforms, progress_callback=progress_cb
+        )
+
+    thread = threading.Thread(target=do_build, daemon=True)
+    thread.start()
+
+    last_step = 0
+    while thread.is_alive():
+        await asyncio.sleep(3)
+        step = current_step["n"]
+        if step != last_step and step in step_messages:
+            last_step = step
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=progress_msg.message_id,
+                    text=step_messages[step],
+                )
+            except Exception:
+                pass
+
+    assets = result_holder.get("assets")
+    if not assets:
+        await context.bot.send_message(chat_id=chat_id, text="❌ Build failed. Type /menu to try again.")
+        return
+
+    # Save files
+    try:
+        paths = save_assets(assets)
+    except Exception as e:
+        await context.bot.send_message(chat_id=chat_id, text=f"❌ Error saving files: {e}")
+        return
+
+    await context.bot.edit_message_text(
+        chat_id=chat_id,
+        message_id=progress_msg.message_id,
+        text="✅ Build complete! Sending your files now...",
+    )
+
+    brand = assets["brand"]
+
+    # Send brand identity summary
+    brand_summary = (
+        f"🎨 *YOUR BRAND IDENTITY*\n\n"
+        f"*Name:* {brand.get('brand_name')}\n"
+        f"*Tagline:* _{brand.get('tagline')}_\n"
+        f"*Mission:* {brand.get('mission')}\n"
+        f"*Brand Promise:* {brand.get('brand_promise')}\n"
+        f"*Unique Mechanism:* {brand.get('unique_mechanism')}\n"
+        f"*Brand Voice:* {brand.get('brand_voice')}\n"
+        f"*Target Avatar:* {brand.get('target_avatar_name')}\n\n"
+        f"*Colors:*\n"
+        f"  Primary: `{brand.get('primary_color')}`\n"
+        f"  Secondary: `{brand.get('secondary_color')}`\n"
+        f"  Accent: `{brand.get('accent_color')}`\n\n"
+        f"*Alternative names:* {', '.join(brand.get('name_alternatives', []))}"
+    )
+    await context.bot.send_message(chat_id=chat_id, text=brand_summary, parse_mode=ParseMode.MARKDOWN)
+
+    # Send website file
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="💻 *Your website file is below.*\n\nTo go live free in 2 minutes:\n1. Download this file\n2. Go to *netlify.com/drop* in Safari\n3. Drag the file onto the page\n4. Your site is live with a free URL",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    with open(paths["website"], "rb") as f:
+        await context.bot.send_document(
+            chat_id=chat_id,
+            document=f,
+            filename=f"{brand.get('brand_name', 'website').replace(' ', '_')}_website.html",
+            caption="Your complete website — ready to deploy",
+        )
+
+    # Send sales copy file
+    await context.bot.send_message(chat_id=chat_id, text="✍️ *Your sales copy package:*", parse_mode=ParseMode.MARKDOWN)
+    with open(paths["sales_copy"], "rb") as f:
+        await context.bot.send_document(
+            chat_id=chat_id,
+            document=f,
+            filename="sales_copy_package.txt",
+            caption="Headlines · Emails · Ad Copy — all pain-point driven",
+        )
+
+    # Send social calendar file
+    await context.bot.send_message(chat_id=chat_id, text="📅 *Your 30-day social media calendar:*", parse_mode=ParseMode.MARKDOWN)
+    with open(paths["social_calendar"], "rb") as f:
+        await context.bot.send_document(
+            chat_id=chat_id,
+            document=f,
+            filename="30_day_social_calendar.txt",
+            caption="30 days of posts — faceless, copy-paste ready",
+        )
+
+    keyboard = [[InlineKeyboardButton("💬 Ask questions about your business", callback_data="coach")]]
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            "🎉 *Your business is built.*\n\n"
+            "What you just received:\n"
+            "✅ Brand identity (name, colors, voice, avatar)\n"
+            "✅ Complete coded website — deploy in 2 min\n"
+            "✅ Full sales copy package\n"
+            "✅ 30-day social content calendar\n\n"
+            "Next steps:\n"
+            "1. Deploy the website at netlify.com/drop\n"
+            "2. Pick your platform and post Day 1 content today\n"
+            "3. Set up a free Calendly link for bookings\n"
+            "4. Come back here daily — ask me anything"
+        ),
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+    context.user_data["coaching_active"] = True
+
+
 # ── /menu command ────────────────────────────────────────────
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     keyboard = [
-        [InlineKeyboardButton("🔍 Search the Internet for Methods", callback_data="research")],
+        [InlineKeyboardButton("🔍 Research AI Income Methods", callback_data="research")],
         [InlineKeyboardButton("⚡ Start Interview", callback_data="interview")],
+        [InlineKeyboardButton("🏗️ Build My Business (Automated)", callback_data="build")],
         [InlineKeyboardButton("💬 Coaching Chat", callback_data="coach")],
         [InlineKeyboardButton("ℹ️ How This Works", callback_data="howto")],
     ]
@@ -638,6 +882,7 @@ def main():
             MAIN_MENU: [
                 CallbackQueryHandler(start_research, pattern="^research$"),
                 CallbackQueryHandler(start_interview, pattern="^interview$"),
+                CallbackQueryHandler(start_build, pattern="^build$"),
                 CallbackQueryHandler(start_coaching, pattern="^coach$"),
                 CallbackQueryHandler(how_to, pattern="^howto$"),
                 CallbackQueryHandler(back_to_menu, pattern="^back_to_menu$"),
@@ -667,6 +912,20 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_coaching_message),
                 CallbackQueryHandler(back_to_menu, pattern="^back_to_menu$"),
                 CallbackQueryHandler(start_coaching, pattern="^coach$"),
+            ],
+            BUILD_NICHE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, build_get_niche),
+            ],
+            BUILD_SERVICE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, build_get_service),
+            ],
+            BUILD_PLATFORMS: [
+                CallbackQueryHandler(build_get_platforms, pattern="^platforms_"),
+            ],
+            BUILDING: [
+                CallbackQueryHandler(start_coaching, pattern="^coach$"),
+                CallbackQueryHandler(back_to_menu, pattern="^back_to_menu$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_coaching_message),
             ],
         },
         fallbacks=[
