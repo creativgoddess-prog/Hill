@@ -1,35 +1,34 @@
 #!/usr/bin/env python3
 """
 AI Income Research Bot — Telegram Edition
-Run this on any computer (or Railway/Render cloud) and chat with it
-from your iPhone/iPad via the free Telegram app.
+
+No state machine. The AI reads everything that's been said and done,
+and picks up exactly where the conversation left off — every single time.
 
 Required environment variables:
-    TELEGRAM_BOT_TOKEN   — from @BotFather on Telegram
-    ANTHROPIC_API_KEY    — from console.anthropic.com
+    TELEGRAM_BOT_TOKEN  — from @BotFather on Telegram
+    GROQ_API_KEY        — from console.groq.com (free)
 """
 
 import os
+import json
 import asyncio
 import logging
+import threading
+from pathlib import Path
 from dotenv import load_dotenv
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    ReplyKeyboardRemove,
-)
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
-    ConversationHandler,
-    ContextTypes,
     PicklePersistence,
+    ContextTypes,
     filters,
 )
-from telegram.constants import ParseMode, ChatAction
+from telegram.constants import ChatAction, ParseMode
 
 load_dotenv()
 logging.basicConfig(
@@ -38,42 +37,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── Conversation states ──────────────────────────────────────
-(
-    MAIN_MENU,
-    RESEARCHING,
-    SHOWING_METHODS,
-    INTERVIEW,
-    RECOMMENDING,
-    CHOOSING_METHOD,
-    PLANNING,
-    COACHING,
-    BUILD_NICHE,
-    BUILD_SERVICE,
-    BUILD_PLATFORMS,
-    BUILDING,
-) = range(12)
 
-# ── Interview questions ──────────────────────────────────────
-INTERVIEW_QUESTIONS = [
-    ("background",      "1️⃣ What's your current job or background?\n\n(e.g. marketing, writing, customer service, IT, student, stay-at-home parent, etc.)"),
-    ("skills",          "2️⃣ What skills do you already have?\n\nList anything you're good at — writing, design, talking to people, organizing, tech, cooking, fitness, etc. Don't be modest!"),
-    ("ai_experience",   "3️⃣ Have you used AI tools before? Which ones and for what?\n\n(ChatGPT, Claude, Canva AI, Midjourney, etc. — say 'none' if not yet)"),
-    ("time",            "4️⃣ How many hours per day can you realistically commit?\n\n(Be honest — 1 hour vs 4 hours changes the plan significantly)"),
-    ("budget",          "5️⃣ What is your actual startup budget?\n\n(How much can you spend on tools/subscriptions in Month 1?)"),
-    ("income_goal",     "6️⃣ What are your income goals?\n\nMonth 1 target? Month 3? Month 6?\n\n(Be specific — '$2,000 Month 1, $5,000 Month 3' is better than 'as much as possible')"),
-    ("platform",        "7️⃣ Are you comfortable with social media? Which platforms?\n\n(Instagram, TikTok, LinkedIn, YouTube, Facebook, X/Twitter, etc.)"),
-    ("writing",         "8️⃣ On a scale of 1-10, how comfortable are you with writing?\n\n1 = I hate writing. 10 = I write well and enjoy it."),
-    ("tech",            "9️⃣ On a scale of 1-10, how comfortable are you with technology and learning new software?\n\n1 = I struggle with new apps. 10 = I pick up any tool quickly."),
-    ("avoid",           "🔟 Is there anything you absolutely do NOT want to do?\n\n(e.g. be on camera, cold call strangers, work weekends, create videos, etc.)"),
-    ("strengths",       "1️⃣1️⃣ What do you think is your biggest strength that could be valuable to businesses or customers?"),
-    ("why",             "1️⃣2️⃣ Last one: WHY do you want to do this?\n\nWhat's really motivating you — freedom, escaping a job, extra income, building something of your own?"),
-]
+# ─────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────
 
-
-# ── Helper: split long text into Telegram-safe chunks ────────
 def split_message(text: str, limit: int = 4000) -> list[str]:
-    """Split text into chunks that fit Telegram's 4096-char limit."""
     if len(text) <= limit:
         return [text]
     chunks = []
@@ -89,937 +58,642 @@ def split_message(text: str, limit: int = 4000) -> list[str]:
     return chunks
 
 
-async def send_long_message(update: Update, text: str, parse_mode=None):
-    """Send a message, splitting into parts if needed."""
-    chunks = split_message(text)
-    for i, chunk in enumerate(chunks):
-        if i == 0:
-            await update.effective_message.reply_text(chunk, parse_mode=parse_mode)
-        else:
-            await update.effective_chat.send_message(chunk, parse_mode=parse_mode)
+async def send_chunks(update: Update, text: str):
+    for chunk in split_message(text):
+        await update.effective_message.reply_text(chunk)
 
 
-async def typing(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def run_in_thread(fn, *args, **kwargs):
+    """Run a blocking function in a thread and return the result."""
+    result = {}
+    def target():
+        try:
+            result["value"] = fn(*args, **kwargs)
+        except Exception as e:
+            result["error"] = str(e)
+    t = threading.Thread(target=target, daemon=True)
+    t.start()
+    return t, result
+
+
+def profile_summary(data: dict) -> str:
+    """One-line summary of what we know about the user."""
+    parts = []
+    if data.get("chosen_method"):
+        parts.append(f"Method: {data['chosen_method']}")
+    if data.get("interview_answers", {}).get("background"):
+        parts.append(f"Background: {data['interview_answers']['background']}")
+    if data.get("interview_answers", {}).get("income_goal"):
+        parts.append(f"Goal: {data['interview_answers']['income_goal']}")
+    return " · ".join(parts) if parts else "No profile yet"
+
+
+# ─────────────────────────────────────────────────────────────
+# Core AI brain — reads ALL context, always knows where we are
+# ─────────────────────────────────────────────────────────────
+
+MASTER_SYSTEM = """You are an AI income coach and business-building partner.
+You have full memory of everything about this user — their profile, skills, goals,
+chosen business method, 30-day plan, and entire conversation history.
+
+YOUR JOB: Pick up EXACTLY where the last conversation left off.
+- If they have a plan → coach them on executing it. Reference it specifically.
+- If they don't have a plan yet → figure out what they need and guide them there.
+- If they're asking a question → answer it with specifics from their situation.
+- If they're stuck → diagnose the exact problem and give a concrete fix.
+- If they want to build something (brand, website, content) → do it.
+
+RULES:
+- Never ask them to repeat information they've already given you.
+- Never say "as I mentioned" — just reference it directly.
+- Always be specific to THEIR situation, never generic.
+- If you need to know something you don't have, ask ONE question at a time.
+- Keep responses focused and actionable. No fluff.
+
+THEIR FULL CONTEXT IS BELOW — read it before every response."""
+
+
+def build_ai_context(user_data: dict) -> str:
+    """Build a complete context block from everything saved in user_data."""
+    sections = []
+
+    profile = user_data.get("interview_answers", {})
+    if profile:
+        lines = [f"  {k}: {v}" for k, v in profile.items() if v]
+        sections.append("USER PROFILE:\n" + "\n".join(lines))
+
+    if user_data.get("chosen_method"):
+        sections.append(f"CHOSEN METHOD: {user_data['chosen_method']}")
+
+    if user_data.get("top_methods"):
+        sections.append(f"RESEARCH FINDINGS (summary):\n{user_data['top_methods'][:800]}")
+
+    if user_data.get("recommendation"):
+        sections.append(f"PERSONALIZED RECOMMENDATION:\n{user_data['recommendation'][:600]}")
+
+    if user_data.get("plan"):
+        sections.append(f"THEIR 30-DAY BUSINESS PLAN:\n{user_data['plan'][:1500]}")
+
+    if user_data.get("brand"):
+        b = user_data["brand"]
+        sections.append(
+            f"BRAND BUILT:\n"
+            f"  Name: {b.get('brand_name')}\n"
+            f"  Tagline: {b.get('tagline')}\n"
+            f"  Promise: {b.get('brand_promise')}"
+        )
+
+    if user_data.get("build_niche"):
+        sections.append(f"BUILD NICHE: {user_data['build_niche']}")
+    if user_data.get("build_service"):
+        sections.append(f"BUILD SERVICE: {user_data['build_service']}")
+
+    history = user_data.get("conversation_history", [])
+    if history:
+        last = history[-20:]  # Last 10 exchanges
+        lines = []
+        for msg in last:
+            role = "User" if msg["role"] == "user" else "You"
+            lines.append(f"{role}: {msg['content'][:300]}")
+        sections.append("RECENT CONVERSATION:\n" + "\n".join(lines))
+
+    if not sections:
+        sections.append("No saved context yet — this is a new user.")
+
+    return "\n\n".join(sections)
+
+
+async def ai_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, user_message: str):
+    """Send user_message to AI with full context, reply to user, save to history."""
     await context.bot.send_chat_action(
-        chat_id=update.effective_chat.id,
-        action=ChatAction.TYPING,
+        chat_id=update.effective_chat.id, action=ChatAction.TYPING
     )
 
+    ctx = build_ai_context(context.user_data)
+    system = MASTER_SYSTEM + f"\n\n{'='*40}\n{ctx}\n{'='*40}"
 
-# ── /start ───────────────────────────────────────────────────
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    # Check if user already has a saved plan in persistent storage
-    has_plan = bool(context.user_data.get("plan"))
+    history = context.user_data.setdefault("conversation_history", [])
+    history.append({"role": "user", "content": user_message})
+
+    messages = history[-30:]  # Keep last 15 exchanges in API call
+
+    t, result = run_in_thread(__import__("src.advisor", fromlist=["ask_ai"]).ask_ai,
+                               system, messages, 2000)
+    while t.is_alive():
+        await asyncio.sleep(1)
+
+    if "error" in result:
+        reply = f"I hit an error: {result['error']}\n\nTry again."
+    else:
+        reply = result.get("value", "Sorry, try again.")
+
+    history.append({"role": "assistant", "content": reply})
+    if len(history) > 60:
+        context.user_data["conversation_history"] = history[-60:]
+
+    await send_chunks(update, reply)
+
+
+# ─────────────────────────────────────────────────────────────
+# /start — smart resume, never asks for things it already knows
+# ─────────────────────────────────────────────────────────────
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    has_plan    = bool(context.user_data.get("plan"))
     has_profile = bool(context.user_data.get("interview_answers"))
-    chosen_method = context.user_data.get("chosen_method", "")
+    has_brand   = bool(context.user_data.get("brand"))
+    method      = context.user_data.get("chosen_method", "")
 
     if has_plan and has_profile:
-        # User has a full session saved — offer to resume instantly
-        keyboard = [
-            [InlineKeyboardButton("▶️ Resume My Business Plan", callback_data="coach")],
-            [InlineKeyboardButton("🔄 Start Over (wipe everything)", callback_data="confirm_reset")],
-        ]
+        built_note = " Your brand and website are also built." if has_brand else ""
+        keyboard = [[InlineKeyboardButton("💬 Continue Coaching", callback_data="coach_resume")]]
         await update.message.reply_text(
-            "👋 *Welcome back!*\n\n"
-            f"I remember everything. Your plan for *{chosen_method}* is saved.\n\n"
-            "Tap *Resume* to jump straight back into coaching — "
-            "no need to redo the interview or research.",
+            f"👋 *Welcome back!* I remember everything.\n\n"
+            f"*Your plan:* {method}\n"
+            f"*Profile:* {profile_summary(context.user_data)}\n"
+            f"{built_note}\n\n"
+            f"Just ask me anything — or tap below to keep going.",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
-        return MAIN_MENU
+        return
 
     if has_profile and not has_plan:
-        # Has profile but no plan yet
         keyboard = [
-            [InlineKeyboardButton("📋 Continue → Build My Plan", callback_data="interview")],
-            [InlineKeyboardButton("🏗️ Build My Business (Automated)", callback_data="build")],
-            [InlineKeyboardButton("🔄 Start Over", callback_data="confirm_reset")],
+            [InlineKeyboardButton("📋 Build My 30-Day Plan", callback_data="make_plan")],
+            [InlineKeyboardButton("🏗️ Build My Business (Brand+Site)", callback_data="build_start")],
         ]
         await update.message.reply_text(
-            "👋 *Welcome back!*\n\n"
-            "I have your profile saved. You haven't built your plan yet.\n\n"
-            "Want to continue where you left off?",
+            "👋 *Welcome back!* I have your profile saved.\n\n"
+            "You haven't built your plan yet — want to do that now?",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
-        return MAIN_MENU
+        return
 
-    # Fresh start — no saved data
+    # Truly new user
     keyboard = [
-        [InlineKeyboardButton("🔍 Research AI Income Methods", callback_data="research")],
-        [InlineKeyboardButton("⚡ Skip Research → Start Interview", callback_data="interview")],
-        [InlineKeyboardButton("🏗️ Build My Business (Automated)", callback_data="build")],
-        [InlineKeyboardButton("💬 Daily Coaching Chat", callback_data="coach")],
-        [InlineKeyboardButton("ℹ️ How This Works", callback_data="howto")],
+        [InlineKeyboardButton("🚀 Let's Go — Start Here", callback_data="onboard")],
+        [InlineKeyboardButton("🏗️ Skip to Building My Business", callback_data="build_start")],
+        [InlineKeyboardButton("🔍 Just Research Methods First", callback_data="research_start")],
     ]
     await update.message.reply_text(
-        "👋 *Welcome to your AI Income Bot!*\n\n"
-        "I can:\n"
-        "🔍 Research what's actually working for AI income in 2026\n"
-        "🎯 Match you with the best method for YOUR skills\n"
-        "📋 Build your 30-day launch plan\n"
-        "🏗️ *Automate your entire business build* — brand, website, content, copy\n"
-        "💬 Coach you daily as your AI business partner\n\n"
-        "*Target: $5,000/month · Under $300 startup · ~2 hrs/day*\n\n"
-        "What do you want to do?",
+        "👋 *Welcome! I'm your AI income bot.*\n\n"
+        "I'll research what's actually working right now, match it to your skills, "
+        "build you a 30-day plan, AND automate your brand, website, and content.\n\n"
+        "Where do you want to start?",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
-    return MAIN_MENU
 
 
-async def confirm_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+# ─────────────────────────────────────────────────────────────
+# Universal message handler — EVERY text goes through the AI
+# ─────────────────────────────────────────────────────────────
+
+async def universal_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+
+    # If we're mid-build, collect the next piece of info
+    build_step = context.user_data.get("build_step")
+    if build_step == "waiting_niche":
+        context.user_data["build_niche"] = text
+        context.user_data["build_step"] = "waiting_service"
+        await update.message.reply_text(
+            f"Got it — *{text}*\n\nWhat specific service or product will you sell?\n\n"
+            "Example: '1-on-1 coaching at $500/month' or 'done-for-you content packages'",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    if build_step == "waiting_service":
+        context.user_data["build_service"] = text
+        context.user_data["build_step"] = "waiting_platforms"
+        keyboard = [
+            [InlineKeyboardButton("Instagram + TikTok", callback_data="plat_ig_tt")],
+            [InlineKeyboardButton("Instagram + LinkedIn", callback_data="plat_ig_li")],
+            [InlineKeyboardButton("TikTok only", callback_data="plat_tt")],
+            [InlineKeyboardButton("LinkedIn only", callback_data="plat_li")],
+            [InlineKeyboardButton("All platforms", callback_data="plat_all")],
+        ]
+        await update.message.reply_text(
+            "Which platforms? (All content is faceless — no camera needed)",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return
+
+    # If mid-interview, collect the answer
+    interview_step = context.user_data.get("interview_step")
+    if interview_step is not None:
+        await handle_interview_message(update, context, text, interview_step)
+        return
+
+    # Otherwise: full AI with everything we know
+    await ai_reply(update, context, text)
+
+
+# ─────────────────────────────────────────────────────────────
+# Conversational onboarding — AI extracts profile from one response
+# ─────────────────────────────────────────────────────────────
+
+ONBOARD_QUESTIONS = [
+    ("background",      "What's your background and current situation?\n(Job, skills, anything you're good at)"),
+    ("time_budget",     "How many hours/day can you work on this, and what's your startup budget?"),
+    ("goals_avoid",     "What are your income goals, and is there anything you refuse to do?\n(e.g. no camera, no cold calling)"),
+    ("why",             "Last one — why are you doing this? What's the real motivation?"),
+]
+
+
+async def start_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["interview_step"] = 0
+    context.user_data["interview_answers"] = {}
+    _, question = ONBOARD_QUESTIONS[0]
+    msg = (
+        "Let's get your profile set up — 4 quick questions.\n\n"
+        f"*Question 1 of 4:* {question}"
+    )
+    if update.callback_query:
+        await update.callback_query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN)
+    else:
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+
+async def handle_interview_message(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                    answer: str, step: int):
+    key, _ = ONBOARD_QUESTIONS[step]
+    context.user_data["interview_answers"][key] = answer
+    next_step = step + 1
+
+    if next_step < len(ONBOARD_QUESTIONS):
+        context.user_data["interview_step"] = next_step
+        _, question = ONBOARD_QUESTIONS[next_step]
+        await update.message.reply_text(
+            f"*Question {next_step + 1} of {len(ONBOARD_QUESTIONS)}:* {question}",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    else:
+        # Interview done
+        context.user_data.pop("interview_step", None)
+        keyboard = [
+            [InlineKeyboardButton("📋 Build My 30-Day Plan", callback_data="make_plan")],
+            [InlineKeyboardButton("🏗️ Build My Business (Brand+Site+Content)", callback_data="build_start")],
+            [InlineKeyboardButton("🔍 Research Methods First", callback_data="research_start")],
+        ]
+        await update.message.reply_text(
+            "✅ *Profile saved!* I know exactly what you need now.\n\n"
+            "What do you want to do first?",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+
+
+# ─────────────────────────────────────────────────────────────
+# Button callbacks
+# ─────────────────────────────────────────────────────────────
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    context.user_data.clear()
-    keyboard = [
-        [InlineKeyboardButton("🔍 Research AI Income Methods", callback_data="research")],
-        [InlineKeyboardButton("⚡ Skip Research → Start Interview", callback_data="interview")],
-        [InlineKeyboardButton("🏗️ Build My Business (Automated)", callback_data="build")],
-        [InlineKeyboardButton("💬 Daily Coaching Chat", callback_data="coach")],
-    ]
-    await query.edit_message_text(
-        "🔄 *All data cleared.* Starting fresh!\n\nWhat do you want to do?",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-    return MAIN_MENU
+    data = query.data
+
+    # Resume coaching
+    if data == "coach_resume":
+        ctx = build_ai_context(context.user_data)
+        await query.edit_message_text(
+            "💬 *Ready. What do you want to work on?*\n\n"
+            "Ask me anything — what to do today, how to get clients, "
+            "write a script, solve a problem — I have full context of your plan.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    # Onboarding
+    if data == "onboard":
+        await start_onboarding(update, context)
+        return
+
+    # Make plan
+    if data == "make_plan":
+        profile = context.user_data.get("interview_answers", {})
+        method = context.user_data.get("chosen_method", "")
+        if not method:
+            await query.edit_message_text(
+                "What method do you want to build your plan for?\n\n"
+                "Type it — e.g. 'AI content writing for small businesses' "
+                "or 'social media management'",
+            )
+            context.user_data["awaiting_method"] = True
+            return
+        await query.edit_message_text(
+            f"📋 Building your 30-day plan for *{method}*...\n\nGive me 60-90 seconds.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        asyncio.create_task(run_plan_task(query.message.chat_id, context))
+        return
+
+    # Research
+    if data == "research_start":
+        await query.edit_message_text(
+            "🔍 *Starting internet research...*\n\n"
+            "Searching for the top AI income methods right now. "
+            "This takes 10-15 minutes. I'll update you as each search completes.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        asyncio.create_task(run_research_task(query.message.chat_id, context))
+        return
+
+    # Build start
+    if data == "build_start":
+        context.user_data["build_step"] = "waiting_niche"
+        await query.edit_message_text(
+            "🏗️ *Building Your Business — Automated*\n\n"
+            "I'll generate your brand, website, 30 days of content, and sales copy.\n\n"
+            "*Question 1:* What is your niche?\n\n"
+            "Be specific — e.g. 'life coaching for single moms' or "
+            "'AI writing services for real estate agents'",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    # Platform selection for build
+    if data.startswith("plat_"):
+        plat_map = {
+            "plat_ig_tt": ["Instagram", "TikTok"],
+            "plat_ig_li": ["Instagram", "LinkedIn"],
+            "plat_tt": ["TikTok"],
+            "plat_li": ["LinkedIn"],
+            "plat_all": ["Instagram", "TikTok", "LinkedIn", "Facebook"],
+        }
+        platforms = plat_map.get(data, ["Instagram", "TikTok"])
+        context.user_data["build_platforms"] = platforms
+        context.user_data["build_step"] = "running"
+
+        niche   = context.user_data.get("build_niche", "")
+        service = context.user_data.get("build_service", "")
+        await query.edit_message_text(
+            f"🚀 *Build started!*\n\n"
+            f"Niche: {niche}\nService: {service}\nPlatforms: {', '.join(platforms)}\n\n"
+            "Running 5 steps automatically. Updates coming...",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        asyncio.create_task(run_build_task(query.message.chat_id, context))
+        return
+
+    # Reset confirm
+    if data == "confirm_reset":
+        context.user_data.clear()
+        await query.edit_message_text(
+            "🔄 All data cleared. Send /start to begin fresh."
+        )
+        return
 
 
-# ── How it works ─────────────────────────────────────────────
-async def how_to(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
+# ─────────────────────────────────────────────────────────────
+# Background tasks: research, plan, build
+# ─────────────────────────────────────────────────────────────
 
-    keyboard = [[InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_to_menu")]]
-
-    await query.edit_message_text(
-        "ℹ️ *How This Bot Works*\n\n"
-        "*Step 1 — Research (10-15 min)*\n"
-        "I search the internet across 8 different queries to find what's actually working for people making money with AI in 2026.\n\n"
-        "*Step 2 — Analysis*\n"
-        "I feed all that research to Claude AI, which ranks the Top 5 methods by real-world results, startup cost, and income potential.\n\n"
-        "*Step 3 — Your Interview*\n"
-        "I ask you 12 questions about your skills, time, budget, and goals. The more honest you are, the better your plan.\n\n"
-        "*Step 4 — Personalized Match*\n"
-        "Based on YOU, I pick the 2-3 best methods with a success probability and explain exactly why.\n\n"
-        "*Step 5 — 30-Day Plan*\n"
-        "Day-by-day action plan: what to do, what tools to use, what to charge, where to find clients, copy-paste scripts.\n\n"
-        "*Step 6 — Daily Coaching*\n"
-        "Chat with me anytime. Ask 'what should I do today?' or any question about your business.\n\n"
-        "💡 *Tip: The research phase takes 10-15 minutes. You can skip it if you want to go straight to the interview.*",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-    return MAIN_MENU
-
-
-async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-
-    keyboard = [
-        [InlineKeyboardButton("🔍 Research AI Income Methods", callback_data="research")],
-        [InlineKeyboardButton("⚡ Skip Research → Start Interview", callback_data="interview")],
-        [InlineKeyboardButton("🏗️ Build My Business (Automated)", callback_data="build")],
-        [InlineKeyboardButton("💬 Daily Coaching Chat", callback_data="coach")],
-        [InlineKeyboardButton("ℹ️ How This Works", callback_data="howto")],
-    ]
-    await query.edit_message_text(
-        "What do you want to do?",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-    return MAIN_MENU
-
-
-# ── RESEARCH PHASE ───────────────────────────────────────────
-async def start_research(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-
-    await query.edit_message_text(
-        "🔍 *Starting deep internet research...*\n\n"
-        "I'm searching the web for the best AI income methods in 2026. "
-        "This takes about 10-15 minutes.\n\n"
-        "⏳ I'll message you as each search topic completes. Sit tight!",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-    # Run research in background
-    asyncio.create_task(run_research_task(update, context))
-    return RESEARCHING
-
-
-async def run_research_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Run research in a background task and message the user with progress."""
-    chat_id = update.effective_chat.id
-
+async def run_research_task(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     from src.researcher import run_deep_research, format_research_for_ai, RESEARCH_QUERIES
     from src.advisor import analyze_research_and_rank_methods
 
-    total = len(RESEARCH_QUERIES)
     progress_msg = await context.bot.send_message(
         chat_id=chat_id,
-        text="🔍 Research progress:\n" + "\n".join([f"⬜ {q[:50]}..." for q in RESEARCH_QUERIES]),
+        text="🔍 Research progress:\n" + "\n".join([f"⬜ {q[:55]}..." for q in RESEARCH_QUERIES]),
     )
-
     completed = []
 
     def progress_cb(current, total, query):
-        completed.append(query[:50] + "...")
+        completed.append(query[:55] + "...")
 
-    import threading
+    t, result = run_in_thread(run_deep_research, progress_callback=progress_cb)
 
-    research_result = {}
-
-    def do_research():
-        research_result["data"] = run_deep_research(progress_callback=progress_cb)
-
-    thread = threading.Thread(target=do_research, daemon=True)
-    thread.start()
-
-    # Poll progress every 5 seconds and update the message
-    while thread.is_alive():
+    while t.is_alive():
         await asyncio.sleep(5)
         if completed:
-            done_lines = "\n".join([f"✅ {q}" for q in completed])
-            remaining = [q[:50] + "..." for q in RESEARCH_QUERIES[len(completed):]]
-            remaining_lines = "\n".join([f"⬜ {q}" for q in remaining])
+            done = "\n".join(f"✅ {q}" for q in completed)
+            remaining = "\n".join(f"⬜ {q[:55]}..." for q in RESEARCH_QUERIES[len(completed):])
             try:
                 await context.bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=progress_msg.message_id,
-                    text=f"🔍 Research progress:\n{done_lines}\n{remaining_lines}",
+                    text=f"🔍 Research progress:\n{done}\n{remaining}",
                 )
             except Exception:
                 pass
 
-    # Mark all done
-    try:
-        done_lines = "\n".join([f"✅ {q[:50]}..." for q in RESEARCH_QUERIES])
-        await context.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=progress_msg.message_id,
-            text=f"✅ All searches complete!\n{done_lines}",
-        )
-    except Exception:
-        pass
-
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text="🧠 *Analyzing everything with AI...*\n\nReading all the research and ranking the top 5 methods. Give me 30-60 seconds...",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-    # Analyze with AI
-    formatted = format_research_for_ai(research_result["data"])
+    research_data = result.get("value", {})
+    formatted = format_research_for_ai(research_data)
     context.user_data["formatted_research"] = formatted
 
-    try:
-        from src.advisor import analyze_research_and_rank_methods
-        import threading
+    await context.bot.send_message(chat_id=chat_id,
+        text="🧠 Analyzing with AI... (30-60 seconds)")
 
-        result_holder = {}
+    t2, result2 = run_in_thread(analyze_research_and_rank_methods, formatted)
+    while t2.is_alive():
+        await asyncio.sleep(2)
 
-        def do_analysis():
-            result_holder["text"] = analyze_research_and_rank_methods(formatted)
+    top_methods = result2.get("value", "")
+    context.user_data["top_methods"] = top_methods
 
-        t = threading.Thread(target=do_analysis, daemon=True)
-        t.start()
-        while t.is_alive():
-            await asyncio.sleep(2)
-        top_methods = result_holder.get("text", "")
-        context.user_data["top_methods"] = top_methods
-
-    except Exception as e:
-        await context.bot.send_message(chat_id=chat_id, text=f"❌ Analysis error: {e}")
-        return
-
-    # Send results in chunks
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text="🎯 *Here are the TOP 5 AI INCOME METHODS for 2026:*",
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    await context.bot.send_message(chat_id=chat_id,
+        text="🎯 *TOP 5 AI INCOME METHODS FOR 2026:*", parse_mode=ParseMode.MARKDOWN)
 
     for chunk in split_message(top_methods):
         await context.bot.send_message(chat_id=chat_id, text=chunk)
 
-    keyboard = [
-        [InlineKeyboardButton("✅ Great! Now personalize this for me →", callback_data="interview")],
-    ]
+    keyboard = [[InlineKeyboardButton("✅ Personalize this for me →", callback_data="onboard")]]
     await context.bot.send_message(
         chat_id=chat_id,
-        text="Now I need to learn about YOU so I can pick the best method for your specific skills and goals.\n\nReady for a quick 12-question interview?",
+        text="Now let me match these to YOUR specific skills and goals.",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
 
-# ── INTERVIEW PHASE ──────────────────────────────────────────
-async def start_interview(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if update.callback_query:
-        await update.callback_query.answer()
-        send_fn = update.callback_query.message.reply_text
-    else:
-        send_fn = update.message.reply_text
+async def run_plan_task(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    from src.advisor import generate_business_plan
 
-    context.user_data["interview_index"] = 0
-    context.user_data["interview_answers"] = {}
+    method  = context.user_data.get("chosen_method", "AI content writing")
+    profile = context.user_data.get("interview_answers", {})
 
-    await send_fn(
-        "📋 *Personal Skills & Goals Interview*\n\n"
-        "I need to understand YOU so I can match you with the best method.\n\n"
-        "Be as honest and specific as possible — vague answers get generic plans, "
-        "specific answers get a plan built exactly for you.\n\n"
-        "Let's go! 12 questions total.",
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    t, result = run_in_thread(generate_business_plan, method, profile)
+    while t.is_alive():
+        await asyncio.sleep(2)
 
-    key, question = INTERVIEW_QUESTIONS[0]
-    await send_fn(question)
-    return INTERVIEW
-
-
-async def handle_interview_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    answer = update.message.text.strip()
-    idx = context.user_data.get("interview_index", 0)
-    answers = context.user_data.setdefault("interview_answers", {})
-
-    key, _ = INTERVIEW_QUESTIONS[idx]
-    answers[key] = answer
-    idx += 1
-    context.user_data["interview_index"] = idx
-
-    if idx < len(INTERVIEW_QUESTIONS):
-        _, next_question = INTERVIEW_QUESTIONS[idx]
-        await update.message.reply_text(next_question)
-        return INTERVIEW
-
-    # All questions answered → generate recommendation
-    await update.message.reply_text(
-        "✅ *Interview complete!*\n\n"
-        "🧠 Analyzing your profile and matching you with the best methods...\n\n"
-        "This takes about 30-60 seconds.",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-    asyncio.create_task(run_recommendation_task(update, context))
-    return RECOMMENDING
-
-
-# ── RECOMMENDATION PHASE ─────────────────────────────────────
-async def run_recommendation_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    user_profile = context.user_data.get("interview_answers", {})
-    top_methods = context.user_data.get("top_methods", "")
-
-    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-
-    # If no prior research, use built-in knowledge
-    if not top_methods:
-        top_methods = (
-            "Top AI income methods in 2026: "
-            "1) AI Content Writing & Social Media Management, "
-            "2) AI Freelance Services (copywriting, email, SEO), "
-            "3) AI Automation Agency (chatbots, workflows), "
-            "4) AI Digital Products (courses, templates, prompts), "
-            "5) AI Prompt Engineering & Consulting."
-        )
-
-    try:
-        import threading
-        from src.advisor import generate_personalized_recommendation
-
-        result_holder = {}
-
-        def do_recommendation():
-            result_holder["text"] = generate_personalized_recommendation(top_methods, user_profile)
-
-        t = threading.Thread(target=do_recommendation, daemon=True)
-        t.start()
-        while t.is_alive():
-            await asyncio.sleep(2)
-
-        recommendation = result_holder.get("text", "")
-        context.user_data["recommendation"] = recommendation
-
-    except Exception as e:
-        await context.bot.send_message(chat_id=chat_id, text=f"❌ Error: {e}")
+    plan = result.get("value", "")
+    if not plan:
+        await context.bot.send_message(chat_id=chat_id,
+            text=f"❌ Plan error: {result.get('error', 'unknown')}")
         return
 
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text="🎯 *YOUR PERSONALIZED RECOMMENDATION:*",
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    context.user_data["plan"] = plan
 
-    for chunk in split_message(recommendation):
-        await context.bot.send_message(chat_id=chat_id, text=chunk)
-
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=(
-            "💬 *Which method do you want to build your 30-day plan for?*\n\n"
-            "Type the name or a short description of the method you're choosing. "
-            "(e.g. 'AI content writing' or 'social media management' or 'chatbot agency')"
-        ),
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-    context.user_data["awaiting_method_choice"] = True
-
-
-async def handle_method_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not context.user_data.get("awaiting_method_choice"):
-        return await handle_coaching_message(update, context)
-
-    chosen_method = update.message.text.strip()
-    context.user_data["chosen_method"] = chosen_method
-    context.user_data["awaiting_method_choice"] = False
-
-    await update.message.reply_text(
-        f"🚀 *Building your 30-day plan for: {chosen_method}*\n\n"
-        "This is the detailed, day-by-day plan. It may take 60-90 seconds to write. Hang tight!",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-    asyncio.create_task(run_plan_task(update, context))
-    return PLANNING
-
-
-# ── PLANNING PHASE ───────────────────────────────────────────
-async def run_plan_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    method = context.user_data.get("chosen_method", "AI content writing")
-    user_profile = context.user_data.get("interview_answers", {})
-
-    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-
-    try:
-        import threading
-        from src.advisor import generate_business_plan
-
-        result_holder = {}
-
-        def do_plan():
-            result_holder["text"] = generate_business_plan(method, user_profile)
-
-        t = threading.Thread(target=do_plan, daemon=True)
-        t.start()
-        while t.is_alive():
-            await asyncio.sleep(2)
-
-        plan = result_holder.get("text", "")
-        context.user_data["plan"] = plan
-
-    except Exception as e:
-        await context.bot.send_message(chat_id=chat_id, text=f"❌ Error generating plan: {e}")
-        return
-
-    # Save session
-    from src.storage import save_session, save_plan_as_text
-    session_data = {
-        "top_methods": context.user_data.get("top_methods", ""),
-        "user_profile": user_profile,
-        "recommendation": context.user_data.get("recommendation", ""),
-        "chosen_method": method,
-        "plan": plan,
-    }
-    try:
-        session_path = save_session(session_data)
-        plan_path = save_plan_as_text(plan)
-    except Exception:
-        pass
-
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text="📋 *YOUR 30-DAY BUSINESS LAUNCH PLAN:*",
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    await context.bot.send_message(chat_id=chat_id,
+        text="📋 *YOUR 30-DAY LAUNCH PLAN:*", parse_mode=ParseMode.MARKDOWN)
 
     for chunk in split_message(plan):
         await context.bot.send_message(chat_id=chat_id, text=chunk)
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.4)
 
-    keyboard = [
-        [InlineKeyboardButton("💬 Start Daily Coaching Chat", callback_data="coach")],
-        [InlineKeyboardButton("🏠 Back to Main Menu", callback_data="back_to_menu")],
-    ]
     await context.bot.send_message(
         chat_id=chat_id,
-        text=(
-            "✅ *Your plan is ready and saved!*\n\n"
-            "Now what? Start your coaching session. Ask me:\n"
-            "• 'What should I do today?'\n"
-            "• 'How do I find my first client?'\n"
-            "• 'Write me an outreach message'\n"
-            "• 'What AI prompt should I use for this?'\n"
-            "• Any question about your business\n\n"
-            "I'm your daily AI business partner."
-        ),
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        text="✅ Plan saved. Just talk to me — ask anything about your business. "
+             "I now have full context of your plan and will pick up here every time.",
     )
 
-    context.user_data["coaching_active"] = True
 
+async def run_build_task(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    from src.builder import build_full_business, save_assets
 
-# ── COACHING PHASE ───────────────────────────────────────────
-async def start_coaching(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if update.callback_query:
-        await update.callback_query.answer()
-        send_fn = update.callback_query.message.reply_text
-    else:
-        send_fn = update.message.reply_text
-
-    context.user_data["coaching_active"] = True
-    context.user_data.setdefault("conversation_history", [])
-
-    await send_fn(
-        "💬 *Your AI Business Coach is ready!*\n\n"
-        "Ask me anything:\n"
-        "• 'What should I do today?'\n"
-        "• 'How do I find my first client?'\n"
-        "• 'Write me an outreach message for Instagram'\n"
-        "• 'What AI prompt should I use to write a blog post?'\n"
-        "• 'I'm stuck on [specific problem] — help!'\n\n"
-        "Type your question below 👇",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-    return COACHING
-
-
-async def handle_coaching_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    user_message = update.message.text.strip()
-    chat_id = update.effective_chat.id
-
-    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-
-    user_profile = context.user_data.get("interview_answers", {})
-    plan = context.user_data.get("plan", "")
-    chosen_method = context.user_data.get("chosen_method", "AI online business")
-    history = context.user_data.setdefault("conversation_history", [])
-
-    # Keep history manageable
-    if len(history) > 30:
-        history = history[-30:]
-        context.user_data["conversation_history"] = history
-
-    try:
-        import threading
-        from src.advisor import get_coaching_reply
-
-        result_holder = {}
-
-        def do_coaching():
-            result_holder["text"] = get_coaching_reply(
-                user_message, history, user_profile, plan, chosen_method
-            )
-
-        t = threading.Thread(target=do_coaching, daemon=True)
-        t.start()
-        while t.is_alive():
-            await asyncio.sleep(1)
-
-        reply = result_holder.get("text", "Sorry, try again.")
-        history.append({"role": "user", "content": user_message})
-        history.append({"role": "assistant", "content": reply})
-
-    except Exception as e:
-        reply = f"Sorry, I hit an error: {e}\nTry again in a moment."
-
-    for chunk in split_message(reply):
-        await update.message.reply_text(chunk)
-
-    return COACHING
-
-
-# ── BUILD MY BUSINESS FLOW ───────────────────────────────────
-
-async def start_build(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text(
-        "🏗️ *Build My Business — Automated*\n\n"
-        "I will research your audience, then automatically generate:\n\n"
-        "✅ Complete brand identity (name, colors, voice, tagline)\n"
-        "✅ Full coded website — ready to go live in minutes\n"
-        "✅ 30-day social media content calendar\n"
-        "✅ Sales copy (headlines, emails, ad copy)\n\n"
-        "All delivered to you as files right here in Telegram.\n\n"
-        "First — *what is your niche or topic?*\n\n"
-        "Be specific. Instead of 'coaching' say 'life coaching for single moms' "
-        "or 'fitness coaching for men over 40' or 'AI content writing for realtors'.\n\n"
-        "The more specific, the better everything will be.",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-    return BUILD_NICHE
-
-
-async def build_get_niche(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    niche = update.message.text.strip()
-    context.user_data["build_niche"] = niche
-    await update.message.reply_text(
-        f"Got it — *{niche}*\n\n"
-        "What specific service or product will you sell?\n\n"
-        "Examples:\n"
-        "• 1-on-1 coaching calls ($500/month)\n"
-        "• Done-for-you social media content packages\n"
-        "• Online course teaching my method\n"
-        "• AI-written blog content for businesses\n\n"
-        "What's yours?",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-    return BUILD_SERVICE
-
-
-async def build_get_service(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    service = update.message.text.strip()
-    context.user_data["build_service"] = service
-    keyboard = [
-        [InlineKeyboardButton("Instagram + TikTok", callback_data="platforms_ig_tt")],
-        [InlineKeyboardButton("Instagram + LinkedIn", callback_data="platforms_ig_li")],
-        [InlineKeyboardButton("TikTok only", callback_data="platforms_tt")],
-        [InlineKeyboardButton("LinkedIn only", callback_data="platforms_li")],
-        [InlineKeyboardButton("All platforms", callback_data="platforms_all")],
-    ]
-    await update.message.reply_text(
-        "Which social media platforms do you want content for?\n\n"
-        "(All content will be faceless — no camera required)",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-    return BUILD_PLATFORMS
-
-
-async def build_get_platforms(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-
-    platform_map = {
-        "platforms_ig_tt": ["Instagram", "TikTok"],
-        "platforms_ig_li": ["Instagram", "LinkedIn"],
-        "platforms_tt": ["TikTok"],
-        "platforms_li": ["LinkedIn"],
-        "platforms_all": ["Instagram", "TikTok", "LinkedIn", "Facebook"],
-    }
-    platforms = platform_map.get(query.data, ["Instagram", "TikTok"])
-    context.user_data["build_platforms"] = platforms
-
-    niche = context.user_data.get("build_niche", "")
-    service = context.user_data.get("build_service", "")
-
-    await query.edit_message_text(
-        f"🚀 *Building your complete business now...*\n\n"
-        f"Niche: {niche}\n"
-        f"Service: {service}\n"
-        f"Platforms: {', '.join(platforms)}\n\n"
-        "This runs 5 steps automatically. I'll update you as each one completes.\n"
-        "Estimated time: 5-10 minutes.",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-    asyncio.create_task(run_build_task(query, context))
-    return BUILDING
-
-
-async def run_build_task(query, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = query.message.chat_id
-    niche = context.user_data.get("build_niche", "")
-    service = context.user_data.get("build_service", "")
+    niche     = context.user_data.get("build_niche", "")
+    service   = context.user_data.get("build_service", "")
     platforms = context.user_data.get("build_platforms", ["Instagram", "TikTok"])
 
-    step_messages = {
-        1: "🔍 Step 1/5 — Researching your audience's pain points across the web...",
-        2: "🎨 Step 2/5 — Building your brand identity...",
-        3: "✍️ Step 3/5 — Writing your sales copy (headlines, emails, ads)...",
-        4: "📅 Step 4/5 — Generating your 30-day social content calendar...",
-        5: "💻 Step 5/5 — Coding your complete website...",
+    steps = {
+        1: "🔍 Step 1/5 — Researching audience pain points...",
+        2: "🎨 Step 2/5 — Building brand identity...",
+        3: "✍️  Step 3/5 — Writing sales copy...",
+        4: "📅 Step 4/5 — Generating 30-day social calendar...",
+        5: "💻 Step 5/5 — Coding your website...",
     }
-
-    progress_msg = await context.bot.send_message(
-        chat_id=chat_id,
-        text="⏳ Starting build...",
-    )
-
-    import threading
-    from src.builder import build_full_business, save_assets
-    from pathlib import Path
-    import tempfile
-
-    result_holder = {}
+    progress_msg = await context.bot.send_message(chat_id=chat_id, text="⏳ Starting...")
     current_step = {"n": 0}
 
     def progress_cb(step, msg):
         current_step["n"] = step
 
-    def do_build():
-        result_holder["assets"] = build_full_business(
-            niche, service, platforms, progress_callback=progress_cb
-        )
-
-    thread = threading.Thread(target=do_build, daemon=True)
-    thread.start()
-
-    last_step = 0
-    while thread.is_alive():
+    t, result = run_in_thread(build_full_business, niche, service, platforms, progress_cb)
+    last = 0
+    while t.is_alive():
         await asyncio.sleep(3)
-        step = current_step["n"]
-        if step != last_step and step in step_messages:
-            last_step = step
+        s = current_step["n"]
+        if s != last and s in steps:
+            last = s
             try:
                 await context.bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=progress_msg.message_id,
-                    text=step_messages[step],
+                    text=steps[s],
                 )
             except Exception:
                 pass
 
-    assets = result_holder.get("assets")
+    assets = result.get("value")
     if not assets:
-        await context.bot.send_message(chat_id=chat_id, text="❌ Build failed. Type /menu to try again.")
+        await context.bot.send_message(chat_id=chat_id,
+            text=f"❌ Build error: {result.get('error', 'unknown')}")
         return
 
-    # Save files
-    try:
-        paths = save_assets(assets)
-    except Exception as e:
-        await context.bot.send_message(chat_id=chat_id, text=f"❌ Error saving files: {e}")
-        return
+    paths = save_assets(assets)
+    brand = assets["brand"]
 
+    context.user_data["brand"]          = brand
+    context.user_data["pain_points"]    = assets.get("pain_points", {})
+    context.user_data["build_step"]     = None  # Build complete
+
+    # Send brand summary
+    b_msg = (
+        f"🎨 *BRAND IDENTITY*\n\n"
+        f"*Name:* {brand.get('brand_name')}\n"
+        f"*Tagline:* _{brand.get('tagline')}_\n"
+        f"*Promise:* {brand.get('brand_promise')}\n"
+        f"*Voice:* {brand.get('brand_voice')}\n"
+        f"*Colors:* `{brand.get('primary_color')}` · `{brand.get('secondary_color')}` · `{brand.get('accent_color')}`"
+    )
     await context.bot.edit_message_text(
         chat_id=chat_id,
         message_id=progress_msg.message_id,
-        text="✅ Build complete! Sending your files now...",
+        text=b_msg, parse_mode=ParseMode.MARKDOWN,
     )
 
-    brand = assets["brand"]
+    # Send files
+    for label, path_key, caption in [
+        ("💻 *Website* — upload to netlify.com/drop to go live free:", "website",
+         f"{brand.get('brand_name', 'website').replace(' ','_')}_website.html"),
+        ("✍️ *Sales copy* — headlines, emails, ads:", "sales_copy", "sales_copy.txt"),
+        ("📅 *30-day social calendar* — faceless, copy-paste ready:", "social_calendar",
+         "30_day_social_calendar.txt"),
+    ]:
+        await context.bot.send_message(chat_id=chat_id, text=label, parse_mode=ParseMode.MARKDOWN)
+        with open(paths[path_key], "rb") as f:
+            await context.bot.send_document(chat_id=chat_id, document=f, filename=caption)
 
-    # Send brand identity summary
-    brand_summary = (
-        f"🎨 *YOUR BRAND IDENTITY*\n\n"
-        f"*Name:* {brand.get('brand_name')}\n"
-        f"*Tagline:* _{brand.get('tagline')}_\n"
-        f"*Mission:* {brand.get('mission')}\n"
-        f"*Brand Promise:* {brand.get('brand_promise')}\n"
-        f"*Unique Mechanism:* {brand.get('unique_mechanism')}\n"
-        f"*Brand Voice:* {brand.get('brand_voice')}\n"
-        f"*Target Avatar:* {brand.get('target_avatar_name')}\n\n"
-        f"*Colors:*\n"
-        f"  Primary: `{brand.get('primary_color')}`\n"
-        f"  Secondary: `{brand.get('secondary_color')}`\n"
-        f"  Accent: `{brand.get('accent_color')}`\n\n"
-        f"*Alternative names:* {', '.join(brand.get('name_alternatives', []))}"
-    )
-    await context.bot.send_message(chat_id=chat_id, text=brand_summary, parse_mode=ParseMode.MARKDOWN)
-
-    # Send website file
     await context.bot.send_message(
         chat_id=chat_id,
-        text="💻 *Your website file is below.*\n\nTo go live free in 2 minutes:\n1. Download this file\n2. Go to *netlify.com/drop* in Safari\n3. Drag the file onto the page\n4. Your site is live with a free URL",
+        text="🎉 *Done.* Everything is saved.\n\n"
+             "Just talk to me going forward — I have your full brand, plan, and profile. "
+             "Ask me what to do today, how to get clients, what to post — anything.",
         parse_mode=ParseMode.MARKDOWN,
     )
-    with open(paths["website"], "rb") as f:
-        await context.bot.send_document(
-            chat_id=chat_id,
-            document=f,
-            filename=f"{brand.get('brand_name', 'website').replace(' ', '_')}_website.html",
-            caption="Your complete website — ready to deploy",
-        )
-
-    # Send sales copy file
-    await context.bot.send_message(chat_id=chat_id, text="✍️ *Your sales copy package:*", parse_mode=ParseMode.MARKDOWN)
-    with open(paths["sales_copy"], "rb") as f:
-        await context.bot.send_document(
-            chat_id=chat_id,
-            document=f,
-            filename="sales_copy_package.txt",
-            caption="Headlines · Emails · Ad Copy — all pain-point driven",
-        )
-
-    # Send social calendar file
-    await context.bot.send_message(chat_id=chat_id, text="📅 *Your 30-day social media calendar:*", parse_mode=ParseMode.MARKDOWN)
-    with open(paths["social_calendar"], "rb") as f:
-        await context.bot.send_document(
-            chat_id=chat_id,
-            document=f,
-            filename="30_day_social_calendar.txt",
-            caption="30 days of posts — faceless, copy-paste ready",
-        )
-
-    keyboard = [[InlineKeyboardButton("💬 Ask questions about your business", callback_data="coach")]]
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=(
-            "🎉 *Your business is built.*\n\n"
-            "What you just received:\n"
-            "✅ Brand identity (name, colors, voice, avatar)\n"
-            "✅ Complete coded website — deploy in 2 min\n"
-            "✅ Full sales copy package\n"
-            "✅ 30-day social content calendar\n\n"
-            "Next steps:\n"
-            "1. Deploy the website at netlify.com/drop\n"
-            "2. Pick your platform and post Day 1 content today\n"
-            "3. Set up a free Calendly link for bookings\n"
-            "4. Come back here daily — ask me anything"
-        ),
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-
-    context.user_data["coaching_active"] = True
 
 
-# ── /menu command ────────────────────────────────────────────
-async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    keyboard = [
-        [InlineKeyboardButton("🔍 Research AI Income Methods", callback_data="research")],
-        [InlineKeyboardButton("⚡ Start Interview", callback_data="interview")],
-        [InlineKeyboardButton("🏗️ Build My Business (Automated)", callback_data="build")],
-        [InlineKeyboardButton("💬 Coaching Chat", callback_data="coach")],
-        [InlineKeyboardButton("ℹ️ How This Works", callback_data="howto")],
-    ]
-    await update.message.reply_text(
-        "Main Menu — what do you want to do?",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-    )
-    return MAIN_MENU
+# ─────────────────────────────────────────────────────────────
+# Commands
+# ─────────────────────────────────────────────────────────────
 
-
-# ── /reset command ───────────────────────────────────────────
-async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
+    await update.message.reply_text("🔄 All data wiped. Send /start to begin fresh.")
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    has_profile = bool(context.user_data.get("interview_answers"))
+    has_plan    = bool(context.user_data.get("plan"))
+    has_brand   = bool(context.user_data.get("brand"))
+    method      = context.user_data.get("chosen_method", "None yet")
+    history_len = len(context.user_data.get("conversation_history", []))
+
     await update.message.reply_text(
-        "🔄 All your data has been wiped. Type /start to begin again from scratch.",
+        f"📊 *Your Bot Status*\n\n"
+        f"Profile saved: {'✅' if has_profile else '❌'}\n"
+        f"Business plan: {'✅' if has_plan else '❌'}\n"
+        f"Brand built: {'✅' if has_brand else '❌'}\n"
+        f"Chosen method: {method}\n"
+        f"Messages in memory: {history_len}",
+        parse_mode=ParseMode.MARKDOWN,
     )
-    return ConversationHandler.END
 
 
-# ── Error handler ────────────────────────────────────────────
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.error("Exception while handling update:", exc_info=context.error)
+    logger.error("Update error:", exc_info=context.error)
     if isinstance(update, Update) and update.effective_message:
         await update.effective_message.reply_text(
-            "⚠️ Something went wrong. Type /menu to get back on track."
+            "Something went wrong. Just send your message again."
         )
 
 
-# ── Main ─────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────
+
 def main():
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
-        raise EnvironmentError(
-            "TELEGRAM_BOT_TOKEN not set. Create a bot with @BotFather on Telegram "
-            "and add the token to your .env file."
-        )
+        raise EnvironmentError("TELEGRAM_BOT_TOKEN not set.")
 
-    groq_key = os.getenv("GROQ_API_KEY")
-    gemini_key = os.getenv("GEMINI_API_KEY")
-    anthropic_key = os.getenv("ANTHROPIC_API_KEY")
-    if not groq_key and not gemini_key and not anthropic_key:
+    if not any([os.getenv("GROQ_API_KEY"),
+                os.getenv("GEMINI_API_KEY"),
+                os.getenv("ANTHROPIC_API_KEY")]):
         raise EnvironmentError(
-            "No AI API key found!\n"
-            "FREE (recommended): Get a Groq key at console.groq.com → add GROQ_API_KEY to .env\n"
-            "Also free: Get a Gemini key at aistudio.google.com → add GEMINI_API_KEY to .env\n"
-            "Paid: Get a Claude key at console.anthropic.com → add ANTHROPIC_API_KEY to .env"
+            "No AI key found. Add GROQ_API_KEY from console.groq.com to your .env"
         )
 
     persistence = PicklePersistence(filepath="bot_sessions.pkl")
     app = Application.builder().token(token).persistence(persistence).build()
 
-    conv_handler = ConversationHandler(
-        entry_points=[
-            CommandHandler("start", start),
-            CommandHandler("menu", menu_command),
-        ],
-        states={
-            MAIN_MENU: [
-                CallbackQueryHandler(start_research, pattern="^research$"),
-                CallbackQueryHandler(start_interview, pattern="^interview$"),
-                CallbackQueryHandler(start_build, pattern="^build$"),
-                CallbackQueryHandler(start_coaching, pattern="^coach$"),
-                CallbackQueryHandler(how_to, pattern="^howto$"),
-                CallbackQueryHandler(back_to_menu, pattern="^back_to_menu$"),
-                CallbackQueryHandler(confirm_reset, pattern="^confirm_reset$"),
-            ],
-            RESEARCHING: [
-                CallbackQueryHandler(start_interview, pattern="^interview$"),
-                CallbackQueryHandler(back_to_menu, pattern="^back_to_menu$"),
-            ],
-            SHOWING_METHODS: [
-                CallbackQueryHandler(start_interview, pattern="^interview$"),
-            ],
-            INTERVIEW: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_interview_answer),
-            ],
-            RECOMMENDING: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_method_choice),
-            ],
-            CHOOSING_METHOD: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_method_choice),
-            ],
-            PLANNING: [
-                CallbackQueryHandler(start_coaching, pattern="^coach$"),
-                CallbackQueryHandler(back_to_menu, pattern="^back_to_menu$"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_coaching_message),
-            ],
-            COACHING: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_coaching_message),
-                CallbackQueryHandler(back_to_menu, pattern="^back_to_menu$"),
-                CallbackQueryHandler(start_coaching, pattern="^coach$"),
-            ],
-            BUILD_NICHE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, build_get_niche),
-            ],
-            BUILD_SERVICE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, build_get_service),
-            ],
-            BUILD_PLATFORMS: [
-                CallbackQueryHandler(build_get_platforms, pattern="^platforms_"),
-            ],
-            BUILDING: [
-                CallbackQueryHandler(start_coaching, pattern="^coach$"),
-                CallbackQueryHandler(back_to_menu, pattern="^back_to_menu$"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_coaching_message),
-            ],
-        },
-        fallbacks=[
-            CommandHandler("start", start),
-            CommandHandler("menu", menu_command),
-            CommandHandler("reset", reset_command),
-        ],
-        allow_reentry=True,
-        name="main_conv",
-        persistent=True,
-    )
+    # Commands
+    app.add_handler(CommandHandler("start",  cmd_start))
+    app.add_handler(CommandHandler("reset",  cmd_reset))
+    app.add_handler(CommandHandler("status", cmd_status))
 
-    app.add_handler(conv_handler)
+    # All button taps
+    app.add_handler(CallbackQueryHandler(button_handler))
 
-    # Global fallbacks — fire when the user is outside any active conversation
-    # (e.g. after a restart, before /start, or after a stale button tap)
-    async def global_message_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.message.reply_text(
-            "👋 Send /start to pick up where you left off.\n\n"
-            "Your profile and plan are saved — you won't lose anything."
-        )
+    # Every text message — the AI handles it with full context
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, universal_handler))
 
-    async def global_button_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        await update.callback_query.answer(
-            "Session expired — send /start to continue.", show_alert=False
-        )
-
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, global_message_fallback))
-    app.add_handler(CallbackQueryHandler(global_button_fallback))
     app.add_error_handler(error_handler)
 
-    print("=" * 50)
-    print("AI Income Research Bot — Telegram Edition")
-    print("Bot is running. Open Telegram on your iPhone and")
-    print("search for your bot by username to start chatting!")
-    print("Press Ctrl+C to stop.")
-    print("=" * 50)
-
+    print("Bot running — all messages handled by context-aware AI.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
