@@ -247,7 +247,7 @@ async def run_research_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await context.bot.send_message(
         chat_id=chat_id,
-        text="🧠 *Analyzing everything with AI...*\n\nClaude is reading all the research and ranking the top 5 methods. Give me 30-60 seconds...",
+        text="🧠 *Analyzing everything with AI...*\n\nReading all the research and ranking the top 5 methods. Give me 30-60 seconds...",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -256,25 +256,19 @@ async def run_research_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["formatted_research"] = formatted
 
     try:
-        import anthropic
-        client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-        from src.advisor import ANALYSIS_SYSTEM
+        from src.advisor import analyze_research_and_rank_methods
+        import threading
 
-        prompt = (
-            f"Here is the raw internet research I collected today on AI money-making methods in 2026:\n\n"
-            f"{formatted}\n\n"
-            "Based on this research (plus your own extensive knowledge), produce the TOP 5 AI-POWERED INCOME METHODS for 2026. "
-            "Rank them by: (1) proven real-world results, (2) low barrier to entry, (3) fastest path to $5K/month with under $300 startup.\n\n"
-            "Format your response as clean text (no markdown symbols that don't render in Telegram)."
-        )
+        result_holder = {}
 
-        response = client.messages.create(
-            model="claude-opus-4-7",
-            max_tokens=4000,
-            system=ANALYSIS_SYSTEM,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        top_methods = response.content[0].text
+        def do_analysis():
+            result_holder["text"] = analyze_research_and_rank_methods(formatted)
+
+        t = threading.Thread(target=do_analysis, daemon=True)
+        t.start()
+        while t.is_alive():
+            await asyncio.sleep(2)
+        top_methods = result_holder.get("text", "")
         context.user_data["top_methods"] = top_methods
 
     except Exception as e:
@@ -361,17 +355,10 @@ async def run_recommendation_task(update: Update, context: ContextTypes.DEFAULT_
 
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
 
-    try:
-        import anthropic
-        from src.advisor import RECOMMENDATION_SYSTEM
-        import json
-
-        client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-        profile_text = "\n".join([f"- {k}: {v}" for k, v in user_profile.items()])
-
-        # If no prior research was done, use built-in knowledge
-        methods_context = top_methods if top_methods else (
-            "Top AI income methods in 2026 based on expert knowledge: "
+    # If no prior research, use built-in knowledge
+    if not top_methods:
+        top_methods = (
+            "Top AI income methods in 2026: "
             "1) AI Content Writing & Social Media Management, "
             "2) AI Freelance Services (copywriting, email, SEO), "
             "3) AI Automation Agency (chatbots, workflows), "
@@ -379,23 +366,21 @@ async def run_recommendation_task(update: Update, context: ContextTypes.DEFAULT_
             "5) AI Prompt Engineering & Consulting."
         )
 
-        prompt = (
-            f"TOP 5 AI INCOME METHODS (from research):\n{methods_context}\n\n"
-            f"USER PROFILE:\n{profile_text}\n\n"
-            "Based on this person's specific skills, budget, time, and goals, "
-            "give a PERSONALIZED recommendation. Pick the best 2-3 methods for THIS person. "
-            "Be specific to them, not generic. Include honest success probability (0-100%) for each. "
-            "Tell them what their Week 1 looks like for Method #1. "
-            "Use plain text, no special markdown symbols."
-        )
+    try:
+        import threading
+        from src.advisor import generate_personalized_recommendation
 
-        response = client.messages.create(
-            model="claude-opus-4-7",
-            max_tokens=3000,
-            system=RECOMMENDATION_SYSTEM,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        recommendation = response.content[0].text
+        result_holder = {}
+
+        def do_recommendation():
+            result_holder["text"] = generate_personalized_recommendation(top_methods, user_profile)
+
+        t = threading.Thread(target=do_recommendation, daemon=True)
+        t.start()
+        while t.is_alive():
+            await asyncio.sleep(2)
+
+        recommendation = result_holder.get("text", "")
         context.user_data["recommendation"] = recommendation
 
     except Exception as e:
@@ -451,36 +436,20 @@ async def run_plan_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
 
     try:
-        import anthropic
-        from src.advisor import PLAN_SYSTEM
+        import threading
+        from src.advisor import generate_business_plan
 
-        client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-        profile_text = "\n".join([f"- {k}: {v}" for k, v in user_profile.items()])
+        result_holder = {}
 
-        prompt = (
-            f"Create a complete 30-DAY LAUNCH PLAN for this person.\n\n"
-            f"CHOSEN METHOD: {method}\n\n"
-            f"USER PROFILE:\n{profile_text}\n\n"
-            "Include:\n"
-            "1. EXACT tools list with costs (under $300 total startup)\n"
-            "2. Day-by-day plan for Week 1\n"
-            "3. Week-by-week plan for Weeks 2-4\n"
-            "4. First client acquisition strategy with specific platforms and outreach scripts\n"
-            "5. Pricing guide (what to charge and why)\n"
-            "6. Income milestones: Week 1, Week 2, Month 1, Month 3\n"
-            "7. The #1 mistake beginners make with this method and how to avoid it\n"
-            "8. How to use AI as your daily work partner (specific prompts to use)\n\n"
-            "Make this so detailed and actionable that they could start TODAY. "
-            "Use plain text without special markdown symbols that won't render on Telegram."
-        )
+        def do_plan():
+            result_holder["text"] = generate_business_plan(method, user_profile)
 
-        response = client.messages.create(
-            model="claude-opus-4-7",
-            max_tokens=5000,
-            system=PLAN_SYSTEM,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        plan = response.content[0].text
+        t = threading.Thread(target=do_plan, daemon=True)
+        t.start()
+        while t.is_alive():
+            await asyncio.sleep(2)
+
+        plan = result_holder.get("text", "")
         context.user_data["plan"] = plan
 
     except Exception as e:
@@ -571,35 +540,29 @@ async def handle_coaching_message(update: Update, context: ContextTypes.DEFAULT_
     chosen_method = context.user_data.get("chosen_method", "AI online business")
     history = context.user_data.setdefault("conversation_history", [])
 
-    from src.advisor import COACH_SYSTEM
-    import json
-
-    profile_text = "\n".join([f"- {k}: {v}" for k, v in user_profile.items()])
-    context_block = (
-        f"USER PROFILE:\n{profile_text}\n\n"
-        f"CHOSEN METHOD: {chosen_method}\n\n"
-        f"THEIR PLAN (first 1500 chars):\n{plan[:1500]}"
-    )
-    system = COACH_SYSTEM + f"\n\nCONTEXT:\n{context_block}"
-
-    history.append({"role": "user", "content": user_message})
-
     # Keep history manageable
     if len(history) > 30:
         history = history[-30:]
         context.user_data["conversation_history"] = history
 
     try:
-        import anthropic
-        client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+        import threading
+        from src.advisor import get_coaching_reply
 
-        response = client.messages.create(
-            model="claude-opus-4-7",
-            max_tokens=2000,
-            system=system,
-            messages=history,
-        )
-        reply = response.content[0].text
+        result_holder = {}
+
+        def do_coaching():
+            result_holder["text"] = get_coaching_reply(
+                user_message, history, user_profile, plan, chosen_method
+            )
+
+        t = threading.Thread(target=do_coaching, daemon=True)
+        t.start()
+        while t.is_alive():
+            await asyncio.sleep(1)
+
+        reply = result_holder.get("text", "Sorry, try again.")
+        history.append({"role": "user", "content": user_message})
         history.append({"role": "assistant", "content": reply})
 
     except Exception as e:
@@ -653,11 +616,13 @@ def main():
             "and add the token to your .env file."
         )
 
+    gemini_key = os.getenv("GEMINI_API_KEY")
     anthropic_key = os.getenv("ANTHROPIC_API_KEY")
-    if not anthropic_key:
+    if not gemini_key and not anthropic_key:
         raise EnvironmentError(
-            "ANTHROPIC_API_KEY not set. Get one at console.anthropic.com "
-            "and add it to your .env file."
+            "No AI API key found!\n"
+            "FREE option: Get a Gemini key at aistudio.google.com → add GEMINI_API_KEY to .env\n"
+            "Paid option: Get a Claude key at console.anthropic.com → add ANTHROPIC_API_KEY to .env"
         )
 
     app = Application.builder().token(token).build()
