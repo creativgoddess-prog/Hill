@@ -39,6 +39,18 @@ _REFUSAL_PHRASES = [
     "i apologize, but i can't", "is there anything else i can help",
     "unethical means", "promote or facilitate", "i'm designed to",
     "my purpose is to provide helpful",
+    # Additional patterns
+    "i can't fulfill", "i cannot fulfill", "fulfill that request",
+    "i'm not going to", "i am not going to", "i won't be able",
+    "that's not something i", "that is not something i",
+    "i'd rather not", "i would rather not",
+    "i don't think i should", "i do not think i should",
+    "not able to assist", "not in a position to",
+    "goes against", "i have to decline", "have to refuse",
+    "i cannot in good", "i'm going to have to decline",
+    "potentially harmful", "could be harmful", "may be harmful",
+    "i must point out", "i should point out",
+    "i'm afraid i can't", "i'm afraid i cannot",
 ]
 
 
