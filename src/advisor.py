@@ -147,24 +147,21 @@ def _ask_claude(system: str, messages: list[dict], max_tokens: int) -> str:
 
 
 def _ask_pollinations(system: str, messages: list[dict], max_tokens: int) -> str:
-    """Completely free, no API key needed — always available as last resort."""
+    """Free, no API key — tries multiple models, Mistral first (less restricted than GPT)."""
     import requests
     full_messages = [{"role": "system", "content": system}] + messages
-    try:
-        resp = requests.post(
-            "https://text.pollinations.ai/",
-            json={
-                "messages": full_messages,
-                "model": "openai",
-                "seed": 42,
-                "private": True,
-            },
-            timeout=60,
-        )
-        if resp.status_code == 200:
-            return resp.text
-    except Exception as e:
-        raise _ProviderExhausted(f"pollinations: {e}")
+    # Try Mistral first — less restricted than openai/GPT on grey-area topics
+    for model in ["mistral", "openai", "command-r"]:
+        try:
+            resp = requests.post(
+                "https://text.pollinations.ai/",
+                json={"messages": full_messages, "model": model, "private": True},
+                timeout=60,
+            )
+            if resp.status_code == 200 and resp.text.strip():
+                return resp.text
+        except Exception:
+            continue
     raise _ProviderExhausted("pollinations")
 
 
