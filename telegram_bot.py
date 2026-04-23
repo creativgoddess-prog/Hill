@@ -17,6 +17,7 @@ import logging
 import threading
 from pathlib import Path
 from dotenv import load_dotenv
+from src.database import load_user, save_user, delete_user, is_available as db_available
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -41,6 +42,33 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────
+# Database helpers — load once, save on every meaningful change
+# ─────────────────────────────────────────────────────────────
+
+async def db_load(context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    """Pull user data from Supabase into context.user_data (once per session)."""
+    if context.user_data.get("_db_loaded"):
+        return
+    if not db_available():
+        context.user_data["_db_loaded"] = True
+        return
+    saved = await asyncio.get_event_loop().run_in_executor(None, load_user, user_id)
+    if saved:
+        for k, v in saved.items():
+            if k not in context.user_data:   # Don't overwrite in-memory changes
+                context.user_data[k] = v
+    context.user_data["_db_loaded"] = True
+
+
+async def db_save(context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    """Push current context.user_data to Supabase."""
+    if not db_available():
+        return
+    data = {k: v for k, v in context.user_data.items() if not k.startswith("_")}
+    await asyncio.get_event_loop().run_in_executor(None, save_user, user_id, data)
+
 
 def split_message(text: str, limit: int = 4000) -> list[str]:
     if len(text) <= limit:
@@ -193,12 +221,18 @@ async def ai_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, user_mess
 
     await send_chunks(update, reply)
 
+    # Save conversation to database after every AI exchange
+    await db_save(context, update.effective_user.id)
+
 
 # ─────────────────────────────────────────────────────────────
 # /start — smart resume, never asks for things it already knows
 # ─────────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Always pull from Supabase first — survives redeployments
+    await db_load(context, update.effective_user.id)
+
     has_plan    = bool(context.user_data.get("plan"))
     has_profile = bool(context.user_data.get("interview_answers"))
     has_brand   = bool(context.user_data.get("brand"))
@@ -252,6 +286,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────────────────────────
 
 async def universal_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Load from Supabase if this is the first message since a restart/redeploy
+    await db_load(context, update.effective_user.id)
+
     text = update.message.text.strip()
 
     # If we're mid-build, collect the next piece of info
@@ -345,6 +382,8 @@ async def handle_interview_message(update: Update, context: ContextTypes.DEFAULT
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
+        # Profile complete — save to Supabase permanently
+        await db_save(context, update.effective_user.id)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -384,6 +423,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             context.user_data["awaiting_method"] = True
             return
+        context.user_data["telegram_user_id"] = query.from_user.id
         await query.edit_message_text(
             f"📋 Building your 30-day plan for *{method}*...\n\nGive me 60-90 seconds.",
             parse_mode=ParseMode.MARKDOWN,
@@ -393,6 +433,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Research
     if data == "research_start":
+        context.user_data["telegram_user_id"] = query.from_user.id
         await query.edit_message_text(
             "🔍 *Starting internet research...*\n\n"
             "Searching for the top AI income methods right now. "
@@ -427,6 +468,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         platforms = plat_map.get(data, ["Instagram", "TikTok"])
         context.user_data["build_platforms"] = platforms
         context.user_data["build_step"] = "running"
+        context.user_data["telegram_user_id"] = query.from_user.id
 
         niche   = context.user_data.get("build_niche", "")
         service = context.user_data.get("build_service", "")
@@ -495,6 +537,14 @@ async def run_research_task(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     top_methods = result2.get("value", "")
     context.user_data["top_methods"] = top_methods
 
+    # Save research results permanently
+    user_id = context.user_data.get("telegram_user_id", 0)
+    if user_id:
+        await asyncio.get_event_loop().run_in_executor(
+            None, save_user, user_id,
+            {k: v for k, v in context.user_data.items() if not k.startswith("_")}
+        )
+
     await context.bot.send_message(chat_id=chat_id,
         text="🎯 *TOP 5 AI INCOME METHODS FOR 2026:*", parse_mode=ParseMode.MARKDOWN)
 
@@ -534,10 +584,18 @@ async def run_plan_task(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=chat_id, text=chunk)
         await asyncio.sleep(0.4)
 
+    # Save plan to Supabase permanently
+    user_id = context.user_data.get("telegram_user_id", 0)
+    if user_id:
+        await asyncio.get_event_loop().run_in_executor(
+            None, save_user, user_id,
+            {k: v for k, v in context.user_data.items() if not k.startswith("_")}
+        )
+
     await context.bot.send_message(
         chat_id=chat_id,
-        text="✅ Plan saved. Just talk to me — ask anything about your business. "
-             "I now have full context of your plan and will pick up here every time.",
+        text="✅ Plan saved permanently. Just talk to me — ask anything about your business. "
+             "I'll remember everything even if the bot restarts.",
     )
 
 
@@ -590,6 +648,14 @@ async def run_build_task(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["pain_points"]    = assets.get("pain_points", {})
     context.user_data["build_step"]     = None  # Build complete
 
+    # Save brand + assets to Supabase permanently
+    user_id = context.user_data.get("telegram_user_id", 0)
+    if user_id:
+        await asyncio.get_event_loop().run_in_executor(
+            None, save_user, user_id,
+            {k: v for k, v in context.user_data.items() if not k.startswith("_")}
+        )
+
     # Send brand summary
     b_msg = (
         f"🎨 *BRAND IDENTITY*\n\n"
@@ -631,7 +697,11 @@ async def run_build_task(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────────────────────────
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
     context.user_data.clear()
+    # Wipe from Supabase too so redeployments don't restore old data
+    if db_available():
+        await asyncio.get_event_loop().run_in_executor(None, delete_user, user_id)
     await update.message.reply_text("🔄 All data wiped. Send /start to begin fresh.")
 
 
