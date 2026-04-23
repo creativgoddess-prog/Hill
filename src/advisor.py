@@ -10,9 +10,10 @@ console = Console()
 # When one is exhausted we try the next — all run on the same free key.
 GROQ_MODELS = [
     "llama-3.3-70b-versatile",   # Best quality — try first
-    "mixtral-8x7b-32768",        # Less restricted, separate limit
+    "llama-3.1-70b-versatile",   # Slightly older, separate daily limit
     "llama-3.1-8b-instant",      # Smaller but very fast, separate limit
     "gemma2-9b-it",              # Google Gemma on Groq, separate limit
+    "llama3-70b-8192",           # Legacy Llama 3, still active
 ]
 
 GEMINI_MODEL = "gemini-2.0-flash"
@@ -52,8 +53,13 @@ def _is_refusal(text: str) -> bool:
     return any(p in low for p in _REFUSAL_PHRASES)
 
 
-def _is_rate_limit(e: Exception) -> bool:
-    return "429" in str(e) or "rate_limit_exceeded" in str(e) or "Rate limit" in str(e)
+def _should_skip_model(e: Exception) -> bool:
+    msg = str(e)
+    return (
+        "429" in msg or "rate_limit_exceeded" in msg or "Rate limit" in msg
+        or "model_decommissioned" in msg or "decommissioned" in msg
+        or "no longer supported" in msg
+    )
 
 
 # ──────────────────────────────────────────────────────────────
@@ -96,12 +102,11 @@ def _ask_groq_any_model(system: str, messages: list[dict], max_tokens: int) -> s
             )
             return response.choices[0].message.content
         except Exception as e:
-            if _is_rate_limit(e):
-                # This model's daily limit is used up — try the next one
-                console.print(f"[yellow]Model {model} rate-limited, trying next...[/yellow]")
+            if _should_skip_model(e):
+                console.print(f"[yellow]Model {model} unavailable ({type(e).__name__}), trying next...[/yellow]")
                 last_error = e
                 continue
-            raise  # Non-rate-limit errors bubble up normally
+            raise  # Non-skippable errors bubble up normally
 
     # All Groq models are exhausted for today
     raise Exception(
