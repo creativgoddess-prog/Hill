@@ -16,7 +16,16 @@ GROQ_MODELS = [
     "llama3-70b-8192",           # Legacy Llama 3, still active
 ]
 
-GEMINI_MODEL = "gemini-2.0-flash"
+# OpenRouter — free tier, far less restricted than Gemini, OpenAI-compatible API
+# Free models available on OpenRouter (no billing needed):
+OPENROUTER_MODELS = [
+    "meta-llama/llama-3.3-70b-instruct:free",   # Same Llama as Groq, separate limit
+    "meta-llama/llama-3.1-8b-instruct:free",     # Fast, permissive
+    "mistralai/mistral-7b-instruct:free",         # Mistral — very open
+    "microsoft/phi-3-medium-128k-instruct:free",  # Microsoft Phi — permissive
+]
+OPENROUTER_BASE = "https://openrouter.ai/api/v1"
+
 CLAUDE_MODEL = "claude-opus-4-7"
 
 # Phrases that mean the model refused instead of answered
@@ -126,68 +135,68 @@ def ask_ai(system: str, messages: list[dict], max_tokens: int = 4000) -> str:
     last_q = messages[-1]["content"] if messages else ""
     bare_messages = [{"role": "user", "content": f"Provide detailed factual information about: {last_q}"}]
 
-    def _try_groq():
-        if not os.getenv("GROQ_API_KEY"):
-            return None
+    def _try_provider(fn):
         try:
-            reply = _ask_groq_any_model(system, messages, max_tokens)
+            reply = fn(system, messages, max_tokens)
             if _is_refusal(reply):
-                reply = _ask_groq_any_model(bare_system, bare_messages, max_tokens)
+                reply = fn(bare_system, bare_messages, max_tokens)
             return reply
         except _GroqExhausted:
-            console.print("[yellow]All Groq models exhausted — switching to Gemini...[/yellow]")
+            console.print("[yellow]Groq exhausted — switching to OpenRouter...[/yellow]")
             return None
-
-    def _try_gemini():
-        if not os.getenv("GEMINI_API_KEY"):
-            return None
-        try:
-            reply = _ask_gemini(system, messages, max_tokens)
-            if _is_refusal(reply):
-                reply = _ask_gemini(bare_system, bare_messages, max_tokens)
-            return reply
         except Exception as e:
-            console.print(f"[yellow]Gemini failed ({e}) — switching to Claude...[/yellow]")
+            console.print(f"[yellow]Provider failed ({e}) — trying next...[/yellow]")
             return None
 
-    def _try_claude():
-        if not os.getenv("ANTHROPIC_API_KEY"):
-            return None
-        reply = _ask_claude(system, messages, max_tokens)
-        if _is_refusal(reply):
-            reply = _ask_claude(bare_system, bare_messages, max_tokens)
-        return reply
+    providers = []
+    if os.getenv("GROQ_API_KEY"):
+        providers.append(_ask_groq_any_model)
+    if os.getenv("OPENROUTER_API_KEY"):
+        providers.append(_ask_openrouter)
+    if os.getenv("ANTHROPIC_API_KEY"):
+        providers.append(_ask_claude)
 
-    for attempt in (_try_groq, _try_gemini, _try_claude):
-        result = attempt()
+    for fn in providers:
+        result = _try_provider(fn)
         if result is not None:
             return result
 
     raise EnvironmentError(
         "No AI available right now.\n\n"
-        "Groq free limits reset at midnight UTC.\n"
-        "For unlimited backup, add GEMINI_API_KEY (free) from aistudio.google.com\n"
-        "to your Railway environment variables."
+        "Groq limits reset at midnight UTC.\n"
+        "Add OPENROUTER_API_KEY (free at openrouter.ai) to Railway for an always-on backup."
     )
 
 
-def _ask_gemini(system: str, messages: list[dict], max_tokens: int) -> str:
-    import google.generativeai as genai
+def _ask_openrouter(system: str, messages: list[dict], max_tokens: int) -> str:
+    """OpenRouter — free models, way less restricted than Gemini, same API as OpenAI."""
+    import requests
 
-    genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-    gemini_history = []
-    for msg in messages[:-1]:
-        role = "model" if msg["role"] == "assistant" else "user"
-        gemini_history.append({"role": role, "parts": [{"text": msg["content"]}]})
+    headers = {
+        "Authorization": f"Bearer {os.getenv('OPENROUTER_API_KEY')}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://github.com/your-bot",
+    }
+    full_messages = [{"role": "system", "content": system}] + messages
 
-    model = genai.GenerativeModel(
-        model_name=GEMINI_MODEL,
-        system_instruction=system,
-        generation_config={"max_output_tokens": max_tokens, "temperature": 0.7},
-    )
-    chat = model.start_chat(history=gemini_history)
-    response = chat.send_message(messages[-1]["content"] if messages else "")
-    return response.text
+    for model in OPENROUTER_MODELS:
+        try:
+            resp = requests.post(
+                f"{OPENROUTER_BASE}/chat/completions",
+                headers=headers,
+                json={"model": model, "messages": full_messages, "max_tokens": max_tokens},
+                timeout=60,
+            )
+            data = resp.json()
+            if "error" in data:
+                console.print(f"[yellow]OpenRouter model {model} failed, trying next...[/yellow]")
+                continue
+            return data["choices"][0]["message"]["content"]
+        except Exception as e:
+            console.print(f"[yellow]OpenRouter {model} error: {e}, trying next...[/yellow]")
+            continue
+
+    raise Exception("All OpenRouter models failed.")
 
 
 def _ask_claude(system: str, messages: list[dict], max_tokens: int) -> str:
