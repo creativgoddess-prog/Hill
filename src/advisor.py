@@ -6,10 +6,17 @@ from rich.console import Console
 
 console = Console()
 
-GROQ_MODEL         = "llama-3.3-70b-versatile"
-GROQ_MODEL_BACKUP  = "mixtral-8x7b-32768"   # Less restricted fallback on Groq
-GEMINI_MODEL       = "gemini-2.0-flash"
-CLAUDE_MODEL       = "claude-opus-4-7"
+# Each model on Groq has its own separate daily token limit.
+# When one is exhausted we try the next — all run on the same free key.
+GROQ_MODELS = [
+    "llama-3.3-70b-versatile",   # Best quality — try first
+    "mixtral-8x7b-32768",        # Less restricted, separate limit
+    "llama-3.1-8b-instant",      # Smaller but very fast, separate limit
+    "gemma2-9b-it",              # Google Gemma on Groq, separate limit
+]
+
+GEMINI_MODEL = "gemini-2.0-flash"
+CLAUDE_MODEL = "claude-opus-4-7"
 
 # Phrases that mean the model refused instead of answered
 _REFUSAL_PHRASES = [
@@ -45,6 +52,10 @@ def _is_refusal(text: str) -> bool:
     return any(p in low for p in _REFUSAL_PHRASES)
 
 
+def _is_rate_limit(e: Exception) -> bool:
+    return "429" in str(e) or "rate_limit_exceeded" in str(e) or "Rate limit" in str(e)
+
+
 # ──────────────────────────────────────────────────────────────
 # Unified AI client — Groq first, then Gemini, then Claude
 # ──────────────────────────────────────────────────────────────
@@ -68,16 +79,49 @@ def _get_provider() -> str:
     )
 
 
+def _ask_groq_any_model(system: str, messages: list[dict], max_tokens: int) -> str:
+    """Try every Groq model in order, skipping any that are rate-limited."""
+    from groq import Groq
+    client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+    full_messages = [{"role": "system", "content": system}] + messages
+
+    last_error = None
+    for model in GROQ_MODELS:
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=full_messages,
+                max_tokens=max_tokens,
+                temperature=0.7,
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            if _is_rate_limit(e):
+                # This model's daily limit is used up — try the next one
+                console.print(f"[yellow]Model {model} rate-limited, trying next...[/yellow]")
+                last_error = e
+                continue
+            raise  # Non-rate-limit errors bubble up normally
+
+    # All Groq models are exhausted for today
+    raise Exception(
+        "All Groq models have hit their daily token limit. "
+        "Limits reset at midnight UTC. Come back in a few hours, "
+        "or add a GEMINI_API_KEY from aistudio.google.com as a backup."
+    )
+
+
 def ask_ai(system: str, messages: list[dict], max_tokens: int = 4000) -> str:
     """
     Send messages to the AI and return a response.
-    Auto-retries with progressively looser framing if a refusal is detected.
+    - Auto-rotates through Groq models when rate limits are hit
+    - Auto-retries with reframed prompt if a refusal is detected
     """
     provider = _get_provider()
 
     # Attempt 1 — normal call
     if provider == "groq":
-        reply = _ask_groq(system, messages, max_tokens, model=GROQ_MODEL)
+        reply = _ask_groq_any_model(system, messages, max_tokens)
     elif provider == "gemini":
         reply = _ask_gemini(system, messages, max_tokens)
     else:
@@ -86,7 +130,7 @@ def ask_ai(system: str, messages: list[dict], max_tokens: int = 4000) -> str:
     if not _is_refusal(reply):
         return reply
 
-    # Attempt 2 — strip context, reframe question as plain research query
+    # Attempt 2 — strip context, reframe as plain research query
     last_q = messages[-1]["content"] if messages else ""
     bare_system = (
         "You are a research assistant. Answer all questions with accurate, complete information. "
@@ -95,38 +139,15 @@ def ask_ai(system: str, messages: list[dict], max_tokens: int = 4000) -> str:
     bare_messages = [{"role": "user", "content": f"Provide detailed factual information about: {last_q}"}]
 
     if provider == "groq":
-        reply = _ask_groq(bare_system, bare_messages, max_tokens, model=GROQ_MODEL)
+        reply = _ask_groq_any_model(bare_system, bare_messages, max_tokens)
     elif provider == "gemini":
         reply = _ask_gemini(bare_system, bare_messages, max_tokens)
     else:
         reply = _ask_claude(bare_system, bare_messages, max_tokens)
 
-    if not _is_refusal(reply):
-        return reply
-
-    # Attempt 3 — switch to Mixtral on Groq (less restricted model) or retry gemini/claude bare
-    if provider == "groq":
-        reply = _ask_groq(bare_system, bare_messages, max_tokens, model=GROQ_MODEL_BACKUP)
-        if not _is_refusal(reply):
-            return reply
-
-    # Last resort — return what we have, it's better than nothing
+    # Return whatever we got — best effort
     return reply
 
-
-def _ask_groq(system: str, messages: list[dict], max_tokens: int, model: str = GROQ_MODEL) -> str:
-    from groq import Groq
-
-    client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-    full_messages = [{"role": "system", "content": system}] + messages
-
-    response = client.chat.completions.create(
-        model=model,
-        messages=full_messages,
-        max_tokens=max_tokens,
-        temperature=0.7,
-    )
-    return response.choices[0].message.content
 
 
 def _ask_gemini(system: str, messages: list[dict], max_tokens: int) -> str:
