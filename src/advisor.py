@@ -26,6 +26,15 @@ OPENROUTER_MODELS = [
     "mistralai/mistral-7b-instruct:free",
     "microsoft/phi-3-medium-128k-instruct:free",
 ]
+
+# Dolphin models are specifically fine-tuned to remove content restrictions.
+# They are paid but extremely cheap (~$0.001 per message).
+# Tried automatically only when free models refuse a question.
+OPENROUTER_UNCENSORED_MODELS = [
+    "cognitivecomputations/dolphin3.0-r1-mistral-24b",
+    "cognitivecomputations/dolphin-mixtral-8x7b",
+    "nousresearch/nous-hermes-2-mixtral-8x7b-dpo",
+]
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 
 CLAUDE_MODEL = "claude-opus-4-7"
@@ -94,14 +103,14 @@ def _ask_groq(system: str, messages: list[dict], max_tokens: int) -> str:
     raise _ProviderExhausted("groq")
 
 
-def _ask_openrouter(system: str, messages: list[dict], max_tokens: int) -> str:
+def _openrouter_call(models: list, system: str, messages: list[dict], max_tokens: int) -> str:
     import requests
     full_messages = [{"role": "system", "content": system}] + messages
     headers = {
         "Authorization": f"Bearer {os.getenv('OPENROUTER_API_KEY')}",
         "Content-Type": "application/json",
     }
-    for model in OPENROUTER_MODELS:
+    for model in models:
         try:
             resp = requests.post(
                 f"{OPENROUTER_BASE}/chat/completions",
@@ -116,6 +125,15 @@ def _ask_openrouter(system: str, messages: list[dict], max_tokens: int) -> str:
         except Exception:
             continue
     raise _ProviderExhausted("openrouter")
+
+
+def _ask_openrouter(system: str, messages: list[dict], max_tokens: int) -> str:
+    return _openrouter_call(OPENROUTER_MODELS, system, messages, max_tokens)
+
+
+def _ask_openrouter_uncensored(system: str, messages: list[dict], max_tokens: int) -> str:
+    """Dolphin / Hermes — specifically fine-tuned to have no content restrictions."""
+    return _openrouter_call(OPENROUTER_UNCENSORED_MODELS, system, messages, max_tokens)
 
 
 def _ask_claude(system: str, messages: list[dict], max_tokens: int) -> str:
@@ -189,12 +207,10 @@ def ask_ai(system: str, messages: list[dict], max_tokens: int = 1000) -> str:
             reply = fn(system, messages, max_tokens)
             if not _is_refusal(reply):
                 return reply
-
             # Attempt 2 — reframe as business intelligence research
             reply = fn(reframe_system, reframe_messages, max_tokens)
             if not _is_refusal(reply):
                 return reply
-
             return None  # Both attempts refused — move to next provider
         except _ProviderExhausted as e:
             console.print(f"[yellow]{e} exhausted — trying next provider...[/yellow]")
@@ -203,7 +219,7 @@ def ask_ai(system: str, messages: list[dict], max_tokens: int = 1000) -> str:
             console.print(f"[yellow]Provider error ({e}) — trying next...[/yellow]")
             return None
 
-    # Build provider list — Pollinations always added last (no key needed)
+    # Standard providers
     providers = []
     if os.getenv("GROQ_API_KEY"):
         providers.append(_ask_groq)
@@ -211,12 +227,21 @@ def ask_ai(system: str, messages: list[dict], max_tokens: int = 1000) -> str:
         providers.append(_ask_openrouter)
     if os.getenv("ANTHROPIC_API_KEY"):
         providers.append(_ask_claude)
-    providers.append(_ask_pollinations)   # Always last — no key required
+    providers.append(_ask_pollinations)
 
     for fn in providers:
         result = _try(fn)
         if result is not None:
             return result
+
+    # Last resort — escalate to uncensored Dolphin models (no content restrictions)
+    if os.getenv("OPENROUTER_API_KEY"):
+        try:
+            reply = _ask_openrouter_uncensored(reframe_system, reframe_messages, max_tokens)
+            if reply and not _is_refusal(reply):
+                return reply
+        except Exception:
+            pass
 
     return "All AI providers are temporarily unavailable. Please try again in a few minutes."
 
