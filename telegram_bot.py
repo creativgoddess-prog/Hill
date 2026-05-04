@@ -18,6 +18,12 @@ import threading
 from pathlib import Path
 from dotenv import load_dotenv
 from src.database import load_user, save_user, delete_user, is_available as db_available
+from src.life_tracker import (
+    EXPOSURE_HIERARCHY, ANXIETY_TIPS, BREATHING_SCRIPTS, STOPP_STEPS,
+    THOUGHT_RECORD_PROMPTS, THINKING_ERRORS, BEHAVIORAL_ACTIVATION_INTRO,
+    CNA_ROADMAP, ai_life_coach, format_exposure_list, format_cna_roadmap,
+    format_cna_step_detail, format_thinking_errors,
+)
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -267,6 +273,10 @@ async def universal_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = update.message.text.strip()
 
+    # Life goals mode takes priority over everything else
+    if await handle_life_mode(update, context, text):
+        return
+
     # If we're mid-build, collect the next piece of info
     build_step = context.user_data.get("build_step")
     if build_step == "waiting_niche":
@@ -370,6 +380,49 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
+
+    # Load from DB if needed
+    await db_load(context, update.effective_user.id)
+
+    # Mood selection during check-in
+    if data.startswith("mood_"):
+        mood_map = {
+            "mood_good": "Good", "mood_neutral": "Neutral",
+            "mood_low": "Low", "mood_frustrated": "Frustrated",
+        }
+        mood = mood_map.get(data, data.replace("mood_", "").capitalize())
+        goals = context.user_data.setdefault("life_goals", {})
+        goals["mood_today"] = mood
+        context.user_data["life_mode"] = "checkin_win"
+        await query.edit_message_text(
+            f"Mood: {mood}.\n\n"
+            "What's ONE small win from today, or something you'll do today?\n"
+            "_(Even tiny wins count: got out of bed, drank water, went outside for a minute)_",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    # Behavioral activation done
+    if data == "activation_done":
+        goals = context.user_data.setdefault("life_goals", {})
+        wins = goals.setdefault("daily_wins", [])
+        wins.append("Completed a behavioral activation task")
+        streak = goals.get("cbt_streak", 0) + 1
+        goals["cbt_streak"] = streak
+        await db_save(context, update.effective_user.id)
+        keyboard = [[InlineKeyboardButton("◀️ CBT Menu", callback_data="life_cbt")]]
+        await query.edit_message_text(
+            f"You did it! That is NOT a small thing.\n\n"
+            f"Action before motivation — that's the whole game. "
+            f"CBT streak: {streak} days.",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return
+
+    # Delegate to life goals handler first
+    handled = await life_button_handler(update, context)
+    if handled:
+        return
 
     # Resume coaching
     if data == "coach_resume":
@@ -708,6 +761,651 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────────────────────────
+# LIFE GOALS HUB — /life
+# ─────────────────────────────────────────────────────────────
+
+async def cmd_life(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await db_load(context, update.effective_user.id)
+    goals = context.user_data.get("life_goals", {})
+    streak = goals.get("cbt_streak", 0)
+    anxiety_base = goals.get("anxiety_baseline", "?")
+    exposures_done = len(goals.get("exposure_completed", []))
+    cna_done = len(goals.get("cna_steps_done", []))
+
+    keyboard = [
+        [InlineKeyboardButton("😰 Social Anxiety (Priority #1)", callback_data="life_anxiety")],
+        [InlineKeyboardButton("🧠 CBT Tools & Exercises", callback_data="life_cbt")],
+        [InlineKeyboardButton("🏥 CNA Career Roadmap", callback_data="life_cna")],
+        [InlineKeyboardButton("📝 Daily Check-In", callback_data="life_checkin")],
+        [InlineKeyboardButton("💬 Talk to Life Coach", callback_data="life_coach_chat")],
+    ]
+    await update.message.reply_text(
+        f"*Your Life Progression Hub*\n\n"
+        f"Top priority: Beat social anxiety\n"
+        f"Career goal: CNA certification & job\n"
+        f"Daily practice: CBT exercises\n\n"
+        f"*Your stats:*\n"
+        f"• CBT streak: {streak} day{'s' if streak != 1 else ''}\n"
+        f"• Anxiety baseline: {anxiety_base}/10\n"
+        f"• Exposure challenges done: {exposures_done}/10\n"
+        f"• CNA roadmap steps done: {cna_done}/8\n\n"
+        f"What do you want to work on?",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# Daily Check-In — /checkin
+# ─────────────────────────────────────────────────────────────
+
+async def cmd_checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await db_load(context, update.effective_user.id)
+    context.user_data["life_mode"] = "checkin_anxiety"
+    await update.message.reply_text(
+        "*Daily Check-In*\n\n"
+        "Let's track how you're doing today.\n\n"
+        "Rate your anxiety level right now from 1-10:\n"
+        "_(1 = totally calm, 10 = severe anxiety)_",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# Social Anxiety command — /anxiety
+# ─────────────────────────────────────────────────────────────
+
+async def cmd_anxiety(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await db_load(context, update.effective_user.id)
+    keyboard = [
+        [InlineKeyboardButton("📊 My Exposure Hierarchy", callback_data="anxiety_exposure")],
+        [InlineKeyboardButton("✅ Log a Challenge Completed", callback_data="anxiety_log_exposure")],
+        [InlineKeyboardButton("🌬️ Breathing Exercises", callback_data="anxiety_breathing")],
+        [InlineKeyboardButton("🛑 STOPP Technique (crisis tool)", callback_data="anxiety_stopp")],
+        [InlineKeyboardButton("💡 Anxiety Tips", callback_data="anxiety_tip")],
+    ]
+    await update.message.reply_text(
+        "*Social Anxiety Toolkit*\n\n"
+        "This is your TOP priority. Anxiety shrinks with action — not waiting.\n\n"
+        "The key: gradual, repeated exposure to the situations you fear.\n"
+        "Each time you face a fear and survive, your brain updates its threat model.\n\n"
+        "What do you need right now?",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# CBT tools — /cbt
+# ─────────────────────────────────────────────────────────────
+
+async def cmd_cbt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await db_load(context, update.effective_user.id)
+    keyboard = [
+        [InlineKeyboardButton("📓 Thought Record", callback_data="cbt_thought_record")],
+        [InlineKeyboardButton("🛑 STOPP Technique", callback_data="anxiety_stopp")],
+        [InlineKeyboardButton("⚡ Behavioral Activation", callback_data="cbt_activation")],
+        [InlineKeyboardButton("🔍 Thinking Error List", callback_data="cbt_errors")],
+        [InlineKeyboardButton("🌬️ Breathing Exercises", callback_data="anxiety_breathing")],
+    ]
+    await update.message.reply_text(
+        "*CBT Daily Practice*\n\n"
+        "Cognitive Behavioral Therapy works by changing the patterns between "
+        "thoughts, feelings, and behaviors.\n\n"
+        "Even 10 minutes a day of structured practice creates real change.\n\n"
+        "Choose an exercise:",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# CNA Career — /cna
+# ─────────────────────────────────────────────────────────────
+
+async def cmd_cna(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await db_load(context, update.effective_user.id)
+    goals = context.user_data.get("life_goals", {})
+    steps_done = goals.get("cna_steps_done", [])
+    roadmap_text = format_cna_roadmap(steps_done)
+
+    keyboard = []
+    for item in CNA_ROADMAP:
+        step = item["step"]
+        label = f"{'✅' if step in steps_done else item['icon']} Step {step}: {item['title']}"
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"cna_step_{step}")])
+    keyboard.append([InlineKeyboardButton("💬 Ask the CNA Coach", callback_data="life_coach_chat")])
+
+    await update.message.reply_text(
+        "*CNA Career Roadmap*\n\n"
+        "Your 8-step path to CNA certification and your first healthcare job.\n\n"
+        f"{roadmap_text}\n\n"
+        "Tap a step for details and tasks:",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# Life Goals Button Handler
+# ─────────────────────────────────────────────────────────────
+
+async def life_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Handle all life-goals-related button callbacks. Returns True if handled."""
+    query = update.callback_query
+    data = query.data
+
+    # ── Life Hub ──────────────────────────────────────────────
+    if data == "life_anxiety":
+        keyboard = [
+            [InlineKeyboardButton("📊 My Exposure Hierarchy", callback_data="anxiety_exposure")],
+            [InlineKeyboardButton("✅ Log a Challenge Completed", callback_data="anxiety_log_exposure")],
+            [InlineKeyboardButton("🌬️ Breathing Exercises", callback_data="anxiety_breathing")],
+            [InlineKeyboardButton("🛑 STOPP Technique", callback_data="anxiety_stopp")],
+            [InlineKeyboardButton("💡 Tip of the Day", callback_data="anxiety_tip")],
+            [InlineKeyboardButton("◀️ Back", callback_data="life_hub")],
+        ]
+        await query.edit_message_text(
+            "*Social Anxiety Toolkit — Priority #1*\n\n"
+            "The goal isn't to feel no anxiety. The goal is to act DESPITE anxiety.\n"
+            "Every time you face a feared situation, you train your brain out of the fear.\n\n"
+            "What do you need?",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return True
+
+    if data == "life_cbt":
+        keyboard = [
+            [InlineKeyboardButton("📓 Thought Record", callback_data="cbt_thought_record")],
+            [InlineKeyboardButton("🛑 STOPP Technique", callback_data="anxiety_stopp")],
+            [InlineKeyboardButton("⚡ Behavioral Activation", callback_data="cbt_activation")],
+            [InlineKeyboardButton("🔍 Thinking Errors List", callback_data="cbt_errors")],
+            [InlineKeyboardButton("🌬️ Breathing", callback_data="anxiety_breathing")],
+            [InlineKeyboardButton("◀️ Back", callback_data="life_hub")],
+        ]
+        await query.edit_message_text(
+            "*CBT Tools*\n\nChoose an exercise:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return True
+
+    if data == "life_cna":
+        goals = context.user_data.get("life_goals", {})
+        steps_done = goals.get("cna_steps_done", [])
+        roadmap_text = format_cna_roadmap(steps_done)
+        keyboard = []
+        for item in CNA_ROADMAP:
+            step = item["step"]
+            label = f"{'✅' if step in steps_done else item['icon']} Step {step}: {item['title']}"
+            keyboard.append([InlineKeyboardButton(label, callback_data=f"cna_step_{step}")])
+        keyboard.append([InlineKeyboardButton("◀️ Back", callback_data="life_hub")])
+        await query.edit_message_text(
+            f"*CNA Career Roadmap*\n\n{roadmap_text}\n\nTap a step for details:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return True
+
+    if data == "life_checkin":
+        context.user_data["life_mode"] = "checkin_anxiety"
+        await query.edit_message_text(
+            "*Daily Check-In*\n\n"
+            "Rate your anxiety level right now from 1-10:\n"
+            "_(1 = totally calm, 10 = severe anxiety)_",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return True
+
+    if data == "life_coach_chat":
+        context.user_data["life_mode"] = "coach_chat"
+        context.user_data.setdefault("life_coach_history", [])
+        await query.edit_message_text(
+            "*Life Coach — I'm here*\n\n"
+            "Tell me what's going on. You can ask about anxiety, CBT, your CNA journey, "
+            "or just vent about what's hard right now.\n\n"
+            "I have full context of your progress. Type anything.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return True
+
+    if data == "life_hub":
+        goals = context.user_data.get("life_goals", {})
+        keyboard = [
+            [InlineKeyboardButton("😰 Social Anxiety (Priority #1)", callback_data="life_anxiety")],
+            [InlineKeyboardButton("🧠 CBT Tools & Exercises", callback_data="life_cbt")],
+            [InlineKeyboardButton("🏥 CNA Career Roadmap", callback_data="life_cna")],
+            [InlineKeyboardButton("📝 Daily Check-In", callback_data="life_checkin")],
+            [InlineKeyboardButton("💬 Talk to Life Coach", callback_data="life_coach_chat")],
+        ]
+        await query.edit_message_text(
+            "*Your Life Progression Hub*\n\nWhat do you want to work on?",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return True
+
+    # ── Social Anxiety ─────────────────────────────────────────
+    if data == "anxiety_exposure":
+        goals = context.user_data.get("life_goals", {})
+        completed = goals.get("exposure_completed", [])
+        exposure_text = format_exposure_list(completed)
+        next_level = next((lvl for lvl, _ in EXPOSURE_HIERARCHY if lvl not in completed), None)
+        keyboard = [
+            [InlineKeyboardButton("✅ I completed a challenge!", callback_data="anxiety_log_exposure")],
+            [InlineKeyboardButton("◀️ Back", callback_data="life_anxiety")],
+        ]
+        tip = f"\n\n*Your next challenge:* Level {next_level} — {EXPOSURE_HIERARCHY[next_level-1][1]}" if next_level else "\n\n*You've completed the full hierarchy! That's incredible.*"
+        await query.edit_message_text(
+            f"*Exposure Hierarchy*\n\n"
+            f"Start at the lowest uncompleted level. Repeat until anxiety drops below 4/10 before moving up.\n\n"
+            f"{exposure_text}{tip}",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return True
+
+    if data == "anxiety_log_exposure":
+        goals = context.user_data.setdefault("life_goals", {})
+        completed = goals.get("exposure_completed", [])
+        keyboard = []
+        for level, task in EXPOSURE_HIERARCHY:
+            if level not in completed:
+                keyboard.append([InlineKeyboardButton(
+                    f"Level {level}: {task[:45]}{'...' if len(task) > 45 else ''}",
+                    callback_data=f"exposure_done_{level}"
+                )])
+        if not keyboard:
+            await query.edit_message_text(
+                "You've completed every level of the exposure hierarchy! You've beaten social anxiety step by step."
+            )
+            return True
+        keyboard.append([InlineKeyboardButton("◀️ Back", callback_data="anxiety_exposure")])
+        await query.edit_message_text(
+            "*Which challenge did you complete?*\n\nTap the one you did:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return True
+
+    if data.startswith("exposure_done_"):
+        level = int(data.split("_")[-1])
+        goals = context.user_data.setdefault("life_goals", {})
+        completed = goals.setdefault("exposure_completed", [])
+        wins = goals.setdefault("daily_wins", [])
+        if level not in completed:
+            completed.append(level)
+            task_desc = EXPOSURE_HIERARCHY[level - 1][1]
+            wins.append(f"Completed exposure Level {level}: {task_desc}")
+            if len(wins) > 20:
+                goals["daily_wins"] = wins[-20:]
+        await db_save(context, update.effective_user.id)
+        next_level = next((lvl for lvl, _ in EXPOSURE_HIERARCHY if lvl not in completed), None)
+        next_msg = (
+            f"\n\n*Next challenge:* Level {next_level} — {EXPOSURE_HIERARCHY[next_level-1][1]}"
+            if next_level else "\n\n*You've conquered the full hierarchy!*"
+        )
+        keyboard = [
+            [InlineKeyboardButton("📊 View My Hierarchy", callback_data="anxiety_exposure")],
+            [InlineKeyboardButton("◀️ Anxiety Menu", callback_data="life_anxiety")],
+        ]
+        await query.edit_message_text(
+            f"*Level {level} complete!*\n\n"
+            f"You did: _{EXPOSURE_HIERARCHY[level-1][1]}_\n\n"
+            f"This is how anxiety gets smaller — one real-world challenge at a time. "
+            f"Your brain is literally rewiring right now.{next_msg}",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return True
+
+    if data == "anxiety_breathing":
+        keyboard = [
+            [InlineKeyboardButton("📦 Box Breathing (4-4-4-4)", callback_data="breath_box")],
+            [InlineKeyboardButton("🌊 4-7-8 Breathing", callback_data="breath_478")],
+            [InlineKeyboardButton("⚡ Physiological Sigh (fastest)", callback_data="breath_sigh")],
+            [InlineKeyboardButton("◀️ Back", callback_data="life_anxiety")],
+        ]
+        await query.edit_message_text(
+            "*Breathing Exercises*\n\n"
+            "These work because slow, deep breathing directly activates your vagus nerve "
+            "and shifts your nervous system from 'fight-or-flight' to 'rest-and-digest.'\n\n"
+            "Which one do you need?",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return True
+
+    if data in ("breath_box", "breath_478", "breath_sigh"):
+        key_map = {"breath_box": "box", "breath_478": "478", "breath_sigh": "physiological_sigh"}
+        script = BREATHING_SCRIPTS[key_map[data]]
+        keyboard = [[InlineKeyboardButton("◀️ Back", callback_data="anxiety_breathing")]]
+        await query.edit_message_text(
+            script,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return True
+
+    if data == "anxiety_stopp":
+        steps_text = "\n\n".join(STOPP_STEPS)
+        keyboard = [[InlineKeyboardButton("◀️ Back", callback_data="life_anxiety")]]
+        await query.edit_message_text(
+            f"*STOPP Technique*\n\n"
+            f"Use this the MOMENT you feel anxiety or panic rising.\n\n"
+            f"{steps_text}\n\n"
+            f"_Practice this when calm so it's automatic when you need it._",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return True
+
+    if data == "anxiety_tip":
+        import random
+        tip = random.choice(ANXIETY_TIPS)
+        keyboard = [
+            [InlineKeyboardButton("Another tip", callback_data="anxiety_tip")],
+            [InlineKeyboardButton("◀️ Back", callback_data="life_anxiety")],
+        ]
+        await query.edit_message_text(
+            f"*Anxiety Insight*\n\n{tip}",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return True
+
+    # ── CBT ───────────────────────────────────────────────────
+    if data == "cbt_thought_record":
+        context.user_data["life_mode"] = "thought_record"
+        context.user_data["thought_record_step"] = 0
+        context.user_data["thought_record_data"] = {}
+        await query.edit_message_text(
+            "*Thought Record*\n\n"
+            "This is one of the most powerful CBT tools. It helps you catch automatic negative "
+            "thoughts and replace them with realistic ones.\n\n"
+            f"*Step 1 of {len(THOUGHT_RECORD_PROMPTS)}:*\n{THOUGHT_RECORD_PROMPTS[0]}",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return True
+
+    if data == "cbt_activation":
+        keyboard = [
+            [InlineKeyboardButton("I'll do it — tell me more", callback_data="cbt_activation_go")],
+            [InlineKeyboardButton("◀️ Back", callback_data="life_cbt")],
+        ]
+        await query.edit_message_text(
+            f"*Behavioral Activation*\n\n{BEHAVIORAL_ACTIVATION_INTRO}",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return True
+
+    if data == "cbt_activation_go":
+        context.user_data["life_mode"] = "activation"
+        await query.edit_message_text(
+            "*Behavioral Activation*\n\n"
+            "What's one thing you've been putting off or avoiding?\n\n"
+            "_(Could be anything: going outside, calling someone, doing one chore, a short walk)_\n\n"
+            "Type it now:",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return True
+
+    if data == "cbt_errors":
+        errors_text = format_thinking_errors()
+        keyboard = [[InlineKeyboardButton("◀️ Back", callback_data="life_cbt")]]
+        await query.edit_message_text(
+            f"*Common Thinking Errors*\n\n"
+            f"These are mental shortcuts that create unnecessary suffering. "
+            f"Recognizing them is the first step to changing them.\n\n"
+            f"{errors_text}",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return True
+
+    # ── CNA Steps ────────────────────────────────────────────
+    if data.startswith("cna_step_"):
+        step_num = int(data.split("_")[-1])
+        goals = context.user_data.get("life_goals", {})
+        steps_done = goals.get("cna_steps_done", [])
+        detail = format_cna_step_detail(step_num)
+        is_done = step_num in steps_done
+        keyboard = []
+        if not is_done:
+            keyboard.append([InlineKeyboardButton(
+                f"✅ Mark Step {step_num} Complete",
+                callback_data=f"cna_complete_{step_num}"
+            )])
+        else:
+            keyboard.append([InlineKeyboardButton(
+                f"↩️ Unmark Step {step_num}",
+                callback_data=f"cna_uncomplete_{step_num}"
+            )])
+        keyboard.append([InlineKeyboardButton("◀️ Back to Roadmap", callback_data="life_cna")])
+        await query.edit_message_text(
+            detail,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return True
+
+    if data.startswith("cna_complete_"):
+        step_num = int(data.split("_")[-1])
+        goals = context.user_data.setdefault("life_goals", {})
+        steps_done = goals.setdefault("cna_steps_done", [])
+        wins = goals.setdefault("daily_wins", [])
+        if step_num not in steps_done:
+            steps_done.append(step_num)
+            step_title = CNA_ROADMAP[step_num - 1]["title"]
+            wins.append(f"CNA Step {step_num} completed: {step_title}")
+            if len(wins) > 20:
+                goals["daily_wins"] = wins[-20:]
+        await db_save(context, update.effective_user.id)
+        next_step = next((i + 1 for i, item in enumerate(CNA_ROADMAP) if item["step"] not in steps_done), None)
+        next_msg = f"\n\n*Next step:* Step {next_step} — {CNA_ROADMAP[next_step-1]['title']}" if next_step else "\n\n*You've completed the full CNA roadmap! Go get that job!*"
+        keyboard = [
+            [InlineKeyboardButton("🏥 View Full Roadmap", callback_data="life_cna")],
+        ]
+        await query.edit_message_text(
+            f"*Step {step_num} marked complete!*\n\n"
+            f"Every step you complete brings you closer to your first healthcare job.{next_msg}",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return True
+
+    if data.startswith("cna_uncomplete_"):
+        step_num = int(data.split("_")[-1])
+        goals = context.user_data.setdefault("life_goals", {})
+        steps_done = goals.get("cna_steps_done", [])
+        if step_num in steps_done:
+            steps_done.remove(step_num)
+        await db_save(context, update.effective_user.id)
+        keyboard = [[InlineKeyboardButton("◀️ Back to Roadmap", callback_data="life_cna")]]
+        await query.edit_message_text(
+            f"Step {step_num} unmarked. Tap it again when it's done.",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return True
+
+    return False
+
+
+# ─────────────────────────────────────────────────────────────
+# Life Goals message handler — processes life_mode state
+# ─────────────────────────────────────────────────────────────
+
+async def handle_life_mode(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> bool:
+    """Handle messages when the bot is in a life-goals mode. Returns True if handled."""
+    mode = context.user_data.get("life_mode")
+    if not mode:
+        return False
+
+    goals = context.user_data.setdefault("life_goals", {})
+
+    # ── Daily check-in ────────────────────────────────────────
+    if mode == "checkin_anxiety":
+        try:
+            level = int(text.strip())
+            if not 1 <= level <= 10:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("Please reply with a number from 1 to 10.")
+            return True
+        goals["anxiety_today"] = level
+        if "anxiety_baseline" not in goals:
+            goals["anxiety_baseline"] = level
+        context.user_data["life_mode"] = "checkin_mood"
+        keyboard = [
+            [InlineKeyboardButton("😊 Good", callback_data="mood_good"),
+             InlineKeyboardButton("😐 Neutral", callback_data="mood_neutral")],
+            [InlineKeyboardButton("😔 Low", callback_data="mood_low"),
+             InlineKeyboardButton("😤 Frustrated", callback_data="mood_frustrated")],
+        ]
+        await update.message.reply_text(
+            f"Logged: Anxiety {level}/10.\n\nHow's your mood overall today?",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        await db_save(context, update.effective_user.id)
+        return True
+
+    if mode == "checkin_mood":
+        goals["mood_today"] = text
+        context.user_data["life_mode"] = "checkin_win"
+        await update.message.reply_text(
+            f"Mood: {text}.\n\n"
+            "What's ONE small win from today, or something you're going to do today?\n"
+            "_(Even tiny wins count: got out of bed, drank water, replied to a message)_",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return True
+
+    if mode == "checkin_win":
+        wins = goals.setdefault("daily_wins", [])
+        wins.append(text)
+        if len(wins) > 20:
+            goals["daily_wins"] = wins[-20:]
+        streak = goals.get("cbt_streak", 0) + 1
+        goals["cbt_streak"] = streak
+        context.user_data.pop("life_mode", None)
+        await db_save(context, update.effective_user.id)
+        anxiety_today = goals.get("anxiety_today", "?")
+        keyboard = [
+            [InlineKeyboardButton("😰 Anxiety tools", callback_data="life_anxiety")],
+            [InlineKeyboardButton("🧠 CBT exercise", callback_data="life_cbt")],
+            [InlineKeyboardButton("🏥 CNA progress", callback_data="life_cna")],
+        ]
+        await update.message.reply_text(
+            f"Check-in complete! Streak: {streak} day{'s' if streak != 1 else ''}.\n\n"
+            f"Win logged: _{text}_\n\n"
+            f"Anxiety today: {anxiety_today}/10. "
+            f"{'Keep going — every day you check in, you stay accountable.' if anxiety_today < 7 else 'Anxiety is high today — use a breathing or STOPP exercise to get some relief.'}\n\n"
+            f"What do you want to work on?",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return True
+
+    # ── Thought Record (multi-step) ───────────────────────────
+    if mode == "thought_record":
+        step = context.user_data.get("thought_record_step", 0)
+        tr_data = context.user_data.setdefault("thought_record_data", {})
+        tr_data[step] = text
+
+        next_step = step + 1
+        if next_step < len(THOUGHT_RECORD_PROMPTS):
+            context.user_data["thought_record_step"] = next_step
+            await update.message.reply_text(
+                f"*Step {next_step + 1} of {len(THOUGHT_RECORD_PROMPTS)}:*\n\n"
+                f"{THOUGHT_RECORD_PROMPTS[next_step]}",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        else:
+            # All steps done — ask AI to review it
+            context.user_data.pop("life_mode", None)
+            context.user_data.pop("thought_record_step", None)
+            formatted = "\n".join(
+                f"Q: {THOUGHT_RECORD_PROMPTS[i]}\nA: {tr_data.get(i, '')}"
+                for i in range(len(THOUGHT_RECORD_PROMPTS))
+            )
+            await update.message.reply_text("Analyzing your thought record...")
+            history = context.user_data.get("life_coach_history", [])
+            response = ai_life_coach(
+                context.user_data, history,
+                f"The user just completed a thought record. Here it is:\n\n{formatted}\n\n"
+                "Review it as a CBT therapist: identify thinking errors, affirm what they did well, "
+                "and help them strengthen the balanced thought."
+            )
+            history.append({"role": "assistant", "content": response})
+            context.user_data["life_coach_history"] = history[-20:]
+            keyboard = [
+                [InlineKeyboardButton("🧠 More CBT", callback_data="life_cbt")],
+                [InlineKeyboardButton("💬 Keep talking", callback_data="life_coach_chat")],
+            ]
+            await update.message.reply_text(
+                f"*Thought Record Complete*\n\n{response}",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+        return True
+
+    # ── Behavioral Activation ─────────────────────────────────
+    if mode == "activation":
+        context.user_data.pop("life_mode", None)
+        history = context.user_data.get("life_coach_history", [])
+        response = ai_life_coach(
+            context.user_data, history,
+            f"The user said they've been avoiding or putting off: '{text}'. "
+            "Help them break this into the smallest possible first step, schedule it today, "
+            "and address any resistance or excuses they might feel. Be warm but firm."
+        )
+        history.append({"role": "assistant", "content": response})
+        context.user_data["life_coach_history"] = history[-20:]
+        keyboard = [
+            [InlineKeyboardButton("✅ I did it!", callback_data="activation_done")],
+            [InlineKeyboardButton("◀️ CBT Menu", callback_data="life_cbt")],
+        ]
+        await update.message.reply_text(
+            response,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return True
+
+    # ── Life Coach Chat ───────────────────────────────────────
+    if mode == "coach_chat":
+        await context.bot.send_chat_action(
+            chat_id=update.effective_chat.id, action=ChatAction.TYPING
+        )
+        history = context.user_data.setdefault("life_coach_history", [])
+        history.append({"role": "user", "content": text})
+        t, result = run_in_thread(ai_life_coach, context.user_data, history[:-1], text)
+        while t.is_alive():
+            await asyncio.sleep(1)
+        if "error" in result:
+            response = f"Error: {result['error']}. Try again."
+        else:
+            response = result.get("value", "Sorry, try again.")
+        history.append({"role": "assistant", "content": response})
+        if len(history) > 20:
+            context.user_data["life_coach_history"] = history[-20:]
+        await db_save(context, update.effective_user.id)
+        keyboard = [
+            [InlineKeyboardButton("😰 Anxiety tools", callback_data="life_anxiety")],
+            [InlineKeyboardButton("🧠 CBT exercise", callback_data="life_cbt")],
+            [InlineKeyboardButton("🏥 CNA roadmap", callback_data="life_cna")],
+        ]
+        await update.message.reply_text(
+            response,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return True
+
+    return False
+
+
+# ─────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────
 
@@ -727,9 +1425,14 @@ def main():
     app = Application.builder().token(token).persistence(persistence).build()
 
     # Commands
-    app.add_handler(CommandHandler("start",  cmd_start))
-    app.add_handler(CommandHandler("reset",  cmd_reset))
-    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("start",   cmd_start))
+    app.add_handler(CommandHandler("reset",   cmd_reset))
+    app.add_handler(CommandHandler("status",  cmd_status))
+    app.add_handler(CommandHandler("life",    cmd_life))
+    app.add_handler(CommandHandler("checkin", cmd_checkin))
+    app.add_handler(CommandHandler("anxiety", cmd_anxiety))
+    app.add_handler(CommandHandler("cbt",     cmd_cbt))
+    app.add_handler(CommandHandler("cna",     cmd_cna))
 
     # All button taps
     app.add_handler(CallbackQueryHandler(button_handler))
